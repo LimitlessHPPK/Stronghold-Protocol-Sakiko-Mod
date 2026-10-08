@@ -1,5 +1,5 @@
 // test/render/issue25-downback.test.js — GitHub issue #25 「部分干员被击倒后在部署状态时仍有攻击动作」, client side: an
-// operator facing UP shows its Back model, and 131 of the 135 Back skeletons have no Die clip, so a knocked-out one went
+// operator facing UP shows its Back model, and 201 of the 207 Back skeletons have no Die clip, so a knocked-out one went
 // on with its looping attack / skill / idle clip under the redeploy ring (a front-facing one lay down). Now it falls and
 // lies with its Front model (render/units.js _wantsBack / _syncModel), stands up again with the Back model (the deploy
 // clip carried over), a Back skeleton with a fall of its own keeps it, and a skeleton without a Die clip holds still
@@ -68,9 +68,8 @@ describe('the manifest (data/assets.json)', () => {
     const backs = Object.entries(M.chars).filter(([, c]) => c.spine?.back);
     const withFall = backs.filter(([, c]) => dieClipDur(c.spine.back) > 0).map(([id]) => id).sort();
     assert.ok(backs.length >= 130, `${backs.length} Back skeletons`);
-    // char_4182_oblvns is the fifth Back model whose skeleton carries a real Die clip (the other four were
-    // the whole list when this was written); her art is a local addition, docs/research/12-sakiko.md.
-    assert.deepEqual(withFall, ['char_388_mint', 'char_4064_mlynar', 'char_4182_oblvns', 'char_440_pinecn', 'char_602_cdfend']);
+    assert.deepEqual(withFall, ['char_322_lmlee', 'char_388_mint', 'char_4064_mlynar', 'char_4182_oblvns', 'char_440_pinecn', 'char_602_cdfend'],
+      '老鲤 (a 自选 pick, 0.2.0) and 丰川祥子 (a 自选 pick, her own Back skeleton) too');
     for (const [id, c] of Object.entries(M.chars)) assert.ok(dieClipDur(c.spine.front) > 0, `${id} Front has a Die clip`);
     assert.equal(dieClipDur(back(CAPER)), 0);
     assert.equal(dieClipDur(front(CAPER)), front(CAPER).animations.Die);

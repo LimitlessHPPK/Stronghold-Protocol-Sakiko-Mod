@@ -40,6 +40,17 @@ powershell -ExecutionPolicy Bypass -File scripts\public-ipv6.ps1 -Join "http://[
 脚本会测 TCP → 拉一次 `/healthz` 确认对面真是这个游戏 → 打开浏览器。
 **或者更简单**：让朋友用**手机流量**直接打开那个地址（手机作为访问方没有任何限制）。
 
+默认绑定已经就是双栈，所以**不用改任何配置**。想自己确认的话：
+
+```powershell
+node tools\doctor.mjs                  # 「朋友如何访问」会列出 IPv4 和 IPv6 地址（IPv6 带方括号）
+curl.exe "http://[::1]:3000/healthz"   # 本机 IPv6 回环
+```
+
+代码里对应三处：`server/http/config.js` 的 `DEFAULT_BIND_HOST = '::'`（绑定地址，含 IPv6 不可用时的
+IPv4 回退）、`server/http/boot.js` 的 `lanUrls()`（开机横幅里的地址清单：IPv6 加方括号、跳过 `fe80::`、
+按 /64 去重）、`tools/doctor.mjs` 的 `classifyAddresses()`（把地址分成局域网 / VPN / 公网 / 虚拟网卡）。
+
 ## 常用参数
 
 | 参数 | 说明 |

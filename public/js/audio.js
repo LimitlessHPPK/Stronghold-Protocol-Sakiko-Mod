@@ -25,7 +25,10 @@
 //   channel over — the official scheduling of `audio_data.json battleVoice.voiceTypeOptions`.
 // - Battle SFX from `b.ev` tuples (`handleBattleEvents`): at most MAX_VOICES concurrent unit sounds, at most
 //   MAX_PER_URL overlapping copies of one sound (the official banks' maxSoundAllowed 2), a per-unit cooldown and a
-//   per-URL minimum gap (SfxLimiter), so a 60-unit fight stays listenable.
+//   per-URL minimum gap (SfxLimiter), so a 60-unit fight stays listenable. A `['skill', id, 1]` that arrives before its
+//   unit is known is held and played once the unit is tracked (`pendingSkill`): a unit that casts inside its own deploy
+//   tick emits that first cue before any `spawn` (or the field's unit list) reached this client, and dropping it left
+//   the one cast silent while every later one played.
 // - Impact sounds (user playtest #4 item 6): a 'dmg' plays the `hit` sound of the unit whose hostile attack ('atk' on a
 //   unit of the other side) aimed at the target — once, within IMPACT_WINDOW_MS, and only for phys / arts / true damage.
 //   A heal "attack" ('atk' of a healer on an ally, chain heals) never makes the healer the author of the next damage
@@ -919,9 +922,10 @@ export class AudioManager {
     this.startVoiceDone = false;
     try { this.voiceGate.reset(); this._stopVoice(); } catch { /* ignore */ }
     for (const u of Array.isArray(units) ? units : []) this._track(u);
-    // …and a cast held for a unit that is STILL unknown must not outlive the field. This runs after the loop: the one
-    // cue this whole mechanism exists for is the one already waiting when the field's own unit list arrives, so the
-    // list must get its chance to claim it first (`_track` answers and removes it).
+    // …and a cast held for a unit that never appears must not outlive the field. This runs after the loop: the one cue
+    // this mechanism exists for is the one already waiting when the field's own unit list arrives (a battle entered
+    // late replays its buffered events to this manager, screens/game.js), so the list gets its chance to claim it
+    // first — `_track` plays and removes it.
     this.pendingSkill.clear();
   }
 
@@ -931,8 +935,8 @@ export class AudioManager {
     // official class sounds (operator vs summon vs device)
     this.units.set(u.id, { def: u.spine || u.defId, defId: u.defId ?? null, kind: u.kind ?? null, side: u.side, boss: !!u.boss,
       skillIndex: Number.isInteger(u.skillIndex) ? u.skillIndex : null });
-    // a cast that arrived before this unit was known (handleBattleEvents): play it now, once. No unit is ever
-    // tracked twice into a stale entry — `setFieldUnits` clears both maps — so this cannot double a cue.
+    // a cast that arrived before this unit was known (handleBattleEvents): play it now, once. No unit is ever tracked
+    // twice into a stale entry — `setFieldUnits` clears both maps — so this cannot double a cue.
     const held = this.pendingSkill.get(u.id);
     if (held) {
       this.pendingSkill.delete(u.id);
@@ -983,12 +987,13 @@ export class AudioManager {
               this.voice(u.def, `skill${n}`, { unitKey: e[1] });
             }
           } else {
-            // The unit is not tracked yet. Its cue is the ONE skill sound a battle can lose this way: a
-            // deployment that casts inside its own first tick (initSp already at spCost — 丰川祥子's S3 with
-            // 30/46, 泥岩, 银灰 …; also an operator deployed into a running battle) emits its `['skill', id, 1]`
-            // before anything told the client about the unit, and `['spawn', unitInfo]` / the field's own unit
-            // list arrive in the same or a later message. Dropping it made that first ultimate silent while
-            // every later cast played (the owner's report). Held here and answered in `_track`, once.
+            // The unit is not tracked yet, and its cue is the ONE skill sound a battle can lose this way: a deployment
+            // that casts inside its own first tick (`initSp` already at `spCost`) emits its `['skill', id, 1]` before
+            // anything told this client about the unit — `['spawn', unitInfo]` and the field's own unit list arrive in
+            // the same or a later message, and an operator deployed into a running battle is the same shape. Dropping
+            // it made that first cast silent while every later one played. Held here and answered once in `_track`,
+            // which is also how the same order inside a replayed pre-entry buffer is covered (screens/game.js hands the
+            // whole buffered list over instead of its 'spawn' tuples alone).
             this.pendingSkill.set(e[1], e);
           }
         } else if (kind === 'engage') {

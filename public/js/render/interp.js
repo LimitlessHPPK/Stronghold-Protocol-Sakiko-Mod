@@ -20,8 +20,8 @@
 //     game s behind) are dropped by the caller's choice (`isCosmeticEvent`); state events — an enemy's form fx
 //     included — are always delivered, and a full queue sheds only cosmetic ones.
 //
-// Snapshot tuple layout (DESIGN §8.2): [id, x, y, hp, maxHp, sp, spMax, flags, anim]. Three optional lists ride along
-// (server/sim/Battle.js snapshot, user playtest #4 items 8 / 9):
+// Snapshot tuple layout (DESIGN §8.2): [id, x, y, hp, maxHp, sp, spMax, flags, anim]. Four optional lists ride along
+// (server/sim/battle/events.js snapshot; `elem` / `down` from user playtest #4 items 8 / 9):
 //   * `elem` [[id, element, fill, cooldownEnd, cooldown]] — the element gauge a unit shows: appended to that unit's
 //     normalised tuple (EL…EL_DUR) and handed out by sample() as `el`, `elFill`, `elUntil`, `elDur` (from the older
 //     snapshot, like flags);
@@ -29,16 +29,16 @@
 //     longer in `units`) and the tile they lie on (where they fell, or their home — sim Battle._layBody; kept only when
 //     both are integers): downAt(time) returns the list of the snapshot at `time`.
 //   * `proj` [[id, x, y, kind]] — content-owned projectiles drawn from their own positions instead of from an 'atk'
-//     event (丰川祥子's notes — she fires them on her own, so there is no attack to hang a visual on; render/fx.js
+//     event (丰川祥子's notes — she fires them on her own, so there is no attack to hang a visual on; render/fx/notes.js
 //     syncNotes): board coordinates like a unit tuple (column x, row y) and the projectile's stable id — an id missing
 //     from a snapshot is a note that is gone. projAt(time) returns the list shown at `time` with x/y interpolated
 //     between the two snapshots bracketing it (like a unit's), so a note lands with the damage it deals. `kind` is
 //     'note' (her talent's) or 'noteSkill' (her skills').
 //   * `fever` [[id, pct]] — the Fever gauge of a unit that carries one (丰川祥子: her talent 2 charges it per damage
-//     instance, a manual cast at ≥ 50 % enters the 20 s Fever — sim content/kits/collab.js): 0..100 and only the units
-//     with a gauge are listed. sample() hands each of them its own `fever` (null: no gauge, i.e. draw nothing) from the
-//     older snapshot, like the other flags; render/units.js draws the bar (and the 50 % threshold) from it. There is no
-//     "Fever is on" field in it — the state itself arrives as the sim's visible 'sakiko:fever' status event.
+//     instance, 蓄满 plus any skill activation enters the 20 s Fever — sim content/kits/ops/op-oblvns.js): 0..100, and
+//     only the units with a gauge are listed. sample() hands each of them its own `fever` (null: no gauge, i.e. draw
+//     nothing) from the older snapshot, like the other flags; render/units.js FEVER_ICON draws the badge from it. There
+//     is no "Fever is on" field in it — the state itself arrives as the sim's visible 'sakiko:fever' status event.
 // Game times in the first two (`cooldownEnd`, `respawnAt`) are on the snapshots' clock, so a view compares them with
 // renderT (`proj` / `fever` carry no time: their entries live exactly as long as the snapshot lists them).
 
@@ -347,6 +347,7 @@ export class SnapshotBuffer {
     const P = !B && ia > 0 ? s[ia - 1] : null; // for extrapolation
     const ext = !B ? clamp(time - A.t, 0, this.maxExtrapolate * this.rate) : 0;
     const stamp = A.t;
+    const fever = A.fever || null;   // b.snap `fever`: flags come from the older snapshot, so does the gauge
     for (const [id, a] of A.units) {
       let o = out.get(id);
       if (!o) { o = { id, x: 0, y: 0, hp: 0, maxHp: 0, sp: 0, spMax: 0, flags: 0, anim: 0, vx: 0, vy: 0, seen: 0, el: null, elFill: 0, elUntil: 0, elDur: 0, fever: null }; out.set(id, o); }
@@ -384,9 +385,7 @@ export class SnapshotBuffer {
       o.flags = a[7];
       o.anim = a[8];
       if (a.length > 9) { o.el = a[9]; o.elFill = a[10]; o.elUntil = a[11]; o.elDur = a[12]; } else if (o.el !== null) { o.el = null; o.elFill = 0; o.elUntil = 0; o.elDur = 0; }
-      // the Fever gauge (b.snap `fever`, see header): the older snapshot's value, like the flags; no entry = no gauge
-      const fv = A.fever ? A.fever.get(id) : undefined;
-      o.fever = typeof fv === 'number' ? fv : null;
+      o.fever = fever ? (fever.get(id) ?? null) : null;
       o.seen = stamp;
     }
     for (const id of out.keys()) if (!A.units.has(id)) out.delete(id);

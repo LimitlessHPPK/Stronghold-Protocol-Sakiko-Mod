@@ -5,11 +5,14 @@
 //     sharing no pixel with any other frame
 //   * render/interp.js: a snapshot's `proj` list ([[id, x, y, kind], …]) is validated with the rest of the payload and
 //     projAt(time) hands it out with positions lerped like a unit's
-//   * render/fx.js FxSystem.syncNotes: one pooled glyph + halo per projectile id — a new id makes a note (with one of
-//     the three glyphs drawn at random and kept for its life), a known id only moves it (to the projected board point,
+//   * render/fx/notes.js FxSystem.syncNotes: one pooled glyph + halo per projectile id — a new id makes a note (with one
+//     of the three glyphs drawn at random and kept for its life), a known id only moves it (to the projected board point,
 //     the same mapping every other projectile uses), an id that leaves the list (or an empty / missing one) flashes in
 //     NOTE_FX, fades out into the pool: sprites are never leaked, at quality 'low' too
-//   * render/app.js: the battle frame feeds interp.projAt(renderT) to fx.syncNotes (source guard: app.js needs a DOM)
+//   * render/fx/projectiles.js attack(): a 'none' attack from a RANGED profile is no melee slash — her normal attack
+//     reports 'none' because the note the kit adds is its whole visual (sim ai.js `noAttackVis`)
+//   * render/app.js: the battle frame feeds interp.projAt(renderT) to fx.syncNotes, and the FX context carries the
+//     ranged-def lookup (source guard: app.js needs a DOM)
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -115,6 +118,35 @@ describe('note projectile visuals', () => {
     }
   });
 
+  test("a ranged 'none' attack is no slash either — the content's own visual is the whole attack", () => {
+    // ai.js reports 'none' for a profile with no projectile visual of its own. For a MELEE profile that is the blow the
+    // slash sweeps; for a RANGED one (丰川祥子's note-carrying normal attack, kits/ops/op-oblvns.js `noAttackVis`) a
+    // crescent at the victim would be a blade effect at range. ctx.rangedOf is the renderer's own range-class lookup
+    // (app.js data.chess(defId).attackKind).
+    const a = { id: 1, x: 4, y: 10, z: 0, hover: 0, _headTiles: 1.2, alive: true, destroyed: false, isEnemy: false, info: { defId: 'char_4182_oblvns' } };
+    const b = { ...a, id: 2, x: 9, y: 10, isEnemy: true };
+    const liveTex = (fx, name) => fx.parts.filter((p) => p.sp.texture === fx.tex[name]).length;
+    const ranged = makeFx();
+    ranged.ctx.rangedOf = () => true;
+    ranged.attack(a, b, 'none');
+    assert.equal(ranged.projs.length, 0, 'no projectile sprite');
+    assert.notEqual(ranged._slashAt, a.id, 'and no pending slash');
+    ranged.damage(b, 300, 'phys', a);                 // the damage lands with no slash to sweep
+    assert.equal(liveTex(ranged, 'slash'), 0);
+    // a 'none' from an attacker the renderer does not know as ranged keeps its slash (every melee operator)
+    const melee = makeFx();
+    melee.ctx.rangedOf = () => false;
+    melee.attack(a, b, 'none');
+    assert.equal(melee._slashAt, a.id);
+    // …and a context without the lookup at all (an older harness) behaves exactly as it did before
+    const older = makeFx();
+    older.attack(a, b, 'none');
+    assert.equal(older._slashAt, a.id);
+    // the real ctx passes the view's UnitInfo too, so a 自选 slot resolves its pick's own attackKind
+    assert.match(readFileSync(new URL('../../public/js/render/app.js', import.meta.url), 'utf8'), /rangedOf: \(defId, info = null\)/,
+      'render/app.js must give the FX context the ranged lookup (data.chess(defId).attackKind)');
+  });
+
   test('the glyph of a note is drawn at random from the three frames, 40 / 40 / 20', () => {
     assert.deepEqual(FX.NOTE_FRAMES.map(([n]) => n), GLYPHS);
     assert.deepEqual(FX.NOTE_FRAMES.map(([, w]) => w), [0.4, 0.4, 0.2]);
@@ -212,16 +244,20 @@ describe('syncNotes (b.snap `proj`)', () => {
 
   test('an id that leaves the list flashes in NOTE_FX, fades out and is pooled (an empty / missing list takes them all)', () => {
     const fx = makeFx();
+    // the parting flash is a `glow` particle; a live note's trail motes are `dot` ones (and its phase is random per
+    // note), so the glow count — not the whole pool — is what "the flash has not happened yet" means
+    const glows = () => fx.parts.filter((p) => p.sp.texture === fx.tex.glow).length;
     fx.syncNotes([[7, 3, 10, 'note']]);
     fx.update(DT);
     const n = fx.notes.get(7);
     assert.equal(n.core.alpha, 1);
-    assert.equal(fx.parts.length, 0, 'nothing yet');
+    assert.equal(glows(), 0, 'no parting flash while it lives');
     fx.syncNotes([]);
     fx.update(DT);
     assert.equal(fx.notes.size, 1, 'still there while it fades');
     assert.ok(n.core.alpha > 0 && n.core.alpha < 1, `fading, not popped out (alpha ${n.core.alpha})`);
     assert.equal(n.core.visible, true);
+    assert.ok(glows() >= 1, 'a parting flash');
     assert.ok(fx.parts.some((p) => p.sp.tint === NOTE_FX), 'the parting flash / sparks are in the effect colour');
     assert.equal(n.burst, true, 'the parting flash happens once');
     const parts = fx.parts.length;

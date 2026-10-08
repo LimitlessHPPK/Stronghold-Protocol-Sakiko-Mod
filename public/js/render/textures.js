@@ -868,8 +868,8 @@ const FX_DRAW = {
     g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
     c.fillStyle = g; c.fillRect(x + 1, y, w - 2, h);
   }],
-  // 丰川祥子's note projectiles (b.snap `proj`, drawn by fx.js syncNotes): one glyph per note, picked at random when it
-  // appears (fx.js NOTE_FRAMES) — 八分音符 `note`, 十六分音符 `note16`, 高音谱号 `treble`. All three are drawn white
+  // 丰川祥子's note projectiles (b.snap `proj`, drawn by fx/notes.js syncNotes): one glyph per note, picked at random when
+  // it appears (notes.js NOTE_FRAMES) — 八分音符 `note`, 十六分音符 `note16`, 高音谱号 `treble`. All three are drawn white
   // (the sprite is tinted: NOTE_INK for the glyph, a halo from the `glow` frame in NOTE_FX behind it) with their ink
   // centred in the cell and ~2/3 of it tall, so one sprite scale (glyph size in px ÷ 128, style.js NOTE_SIZE) fits all.
   note: [128, 256, 128, 128, (c, x, y, w) => drawNote(c, x, y, w, 1)],

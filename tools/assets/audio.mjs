@@ -2,7 +2,9 @@
 //
 // - Unit combat SFX banks are named `battle.<EVENT>.<unitId>[.<ability>[.<n>…]]`
 //   (e.g. battle.ON_ABILITY_START.char_102_texas.attack); skill banks are
-//   `battle.ON_SKILL_START.<skillId>`. pickUnitSfx() turns them into the roles the
+//   `battle.ON_SKILL_START.<skillId>` — the handful of skills whose activation
+//   bank is named differently are the explicit SKILL_START_BANKS table below
+//   (indexAudio().skillStart). pickUnitSfx() turns them into the roles the
 //   client plays: attack (swing/cast), hit (impact), skill (activation), die, born.
 // - BGM banks (`battle.ON_GAME_READY.<event>`, `sys.ON_ACTIVITY_LOADED.<act>`)
 //   carry an optional intro and a loop.
@@ -64,8 +66,8 @@ export function bankMix(sounds, path) {
  * Skill-activation banks whose official name is NOT the `battle.ON_SKILL_START.<skillId>` shape the skill table
  * (and plan.mjs) resolves — one entry per skill id, listing the bank names to read, in order.
  *
- * 丰川祥子 (`skchr_oblvns_1/2/3`, the Ave Mujica collaboration operator this repo adds locally,
- * docs/research/12-sakiko.md) has no bank in that shape for any of her three skills:
+ * 丰川祥子 (`skchr_oblvns_1/2/3`, the Ave Mujica collaboration operator this repo adds locally as a 自选 pick) has no
+ * bank in that shape for any of her three skills:
  *   S1 `battle.ON_ABILITY_START.skchr_oblvns_1`          — three takes of one cast cue (`p_skill_…_d1/d2/d3`);
  *   S2 `battle.ON_SKILL_START.skchr_oblvns_2.1` / `.2`  — the two takes of one cast cue, split over two ability
  *                                                          indices: `.1` carries `…_h2`, `.2` carries `…_h1` (ability
@@ -74,8 +76,9 @@ export function bankMix(sounds, path) {
  *                                                          same skill, `ON_BUFF_START.oblvns_s_3[loop]`, is the sustained
  *                                                          loop, not the cast, and is deliberately not listed).
  * They are listed instead of derived from a bank-name pattern on purpose: 104 of the pool's 352 skills also carry a
- * `battle.ON_ABILITY_START.<skillId>` bank, so accepting that shape generally would add an activation sound to every
- * one of those operators' manifests — a wider decision than "she has no skill sound". skillStart() below only
+ * `battle.ON_ABILITY_START.<skillId>` bank (德克萨斯, 能天使, 银灰, 玛恩纳 … — the same-shape list is a known gap,
+ * deliberately NOT generalised here), so accepting that shape generally would add an activation sound to every one of
+ * those operators' manifests — a wider, engine-level decision than "she has no skill sound". skillStart() below only
  * ever consults this table when the plain `ON_SKILL_START.<skillId>` bank is absent, and a test pins that invariant.
  */
 export const SKILL_START_BANKS = Object.freeze({
@@ -208,6 +211,21 @@ export function pickUnitSfx(banks, opts = {}) {
   };
   const exact = (event) => ['attack', 'combat'].map((ab) => banks.get(`${event}.${ab}`)).find((p) => p?.length && ok(p)) ?? null;
   const own = (p) => (p?.length && ok(p) ? p : null);
+  // operators whose default mode is the unsuffixed ability (a plain attack / combat bank of any event): every numbered
+  // variant (attack.1, attack.2 …) is then a skill mode's ability, whatever its file name — 银灰's attack.2 swing
+  // p_atk_silver_n is his S3 mode's (charpack modes Default / S2 / S3), his normal attack is the Default mode's Combat (impact
+  // ON_ABILITY_HIT.combat p_imp_spear_n, no swing bank): community report of 2026-10-06 (item 54) 「银灰的普通攻击的音效错误
+  // 的使用了3技能期间的攻击音效」. Only the plain banks then, or the operator's own projectile banks; newer operators number
+  // their default mode too (attack.0 …) and keep the rule below
+  if (opts.operator && ['ON_ABILITY_START', 'ON_ABILITY_ON', 'ON_ABILITY_HIT'].some((e) => exact(e))) {
+    const swing = exact('ON_ABILITY_START') ?? exact('ON_ABILITY_ON') ?? own(proj.born);
+    const impact = exact('ON_ABILITY_HIT') ?? own(proj.hit);
+    if (swing) out.attack = swing;
+    if (impact) out.hit = impact;
+    if (banks.get('ON_UNIT_DEAD')?.length) out.die = banks.get('ON_UNIT_DEAD');
+    if (banks.get('ON_UNIT_BORN')?.length) out.born = banks.get('ON_UNIT_BORN');
+    return out;
+  }
   // operators: the plain ability of either event before any numbered variant
   const plain = opts.operator ? exact('ON_ABILITY_START') ?? exact('ON_ABILITY_ON') : null;
   const attack = plain

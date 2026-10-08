@@ -3,7 +3,9 @@
 //
 //   node tools/doctor.mjs [--port 3000] [--host ::]
 //
-// Checks: Node/npm versions, dependencies, public/vendor, data/*.json, downloaded art/audio, optional local-client art,
+// Checks: Node/npm versions, dependencies, public/vendor, data/*.json, the shipped files against the release's
+// MANIFEST.json (server/update.js checkInstall; a source checkout has none) and an update package not applied yet,
+// downloaded art/audio, optional local-client art,
 // Python (only needed for the optional extraction), the port (free / our server running → /healthz / another
 // program), LAN addresses friends can use (virtual adapters and VPNs labelled), firewall hints per OS, tunnel tools
 // (Tailscale, ZeroTier, cloudflared) and the env vars the server reads.
@@ -20,6 +22,7 @@ import {
   checkNode, checkDeps, checkVendor, checkData, checkAssets, checkLocal, findClient, findPython,
   LOCAL_ART_FALLBACK, LOCAL_ART_COPY_HINT,
 } from './setup.mjs';
+import { checkInstall, MANIFEST_FILE, UPDATE_FILE } from '../server/update.js';
 
 // ---------------------------------------------------------------------------------------------------
 // LAN addresses (also used by scripts/launch.mjs)
@@ -44,7 +47,7 @@ function ipv6Head(ip) {
   return [h1, Number.isInteger(h2) ? h2 : 0];
 }
 
-/** An http URL for one address — an IPv6 literal needs brackets. Also used by scripts/launch.mjs. */
+/** An http URL for one address — an IPv6 literal needs brackets (`http://[240e:…]:3000`). Also used by scripts/launch.mjs. */
 export function hostUrl(address, port) {
   return `http://${String(address).includes(':') ? `[${address}]` : address}:${port}`;
 }
@@ -61,7 +64,7 @@ function classifyV6(name, ip) {
   if (h1 === 0x2002 || (h1 === 0x2001 && h2 === 0x0db8)) return 'virtual';
   if (VPN_IF.test(name)) return 'vpn';
   if (VIRTUAL_IF.test(name)) return 'virtual';
-  if ((h1 & 0xfe00) === 0xfc00) return 'lan';   // fc00::/7 ULA — the IPv6 RFC 1918
+  if ((h1 & 0xfe00) === 0xfc00) return 'lan';    // fc00::/7 ULA — the IPv6 RFC 1918
   if ((h1 & 0xe000) === 0x2000) return 'public'; // 2000::/3 global unicast
   return 'virtual';
 }
@@ -79,8 +82,8 @@ export function classifyAddresses(ifaces = os.networkInterfaces()) {
   const v6Seen = new Set(); // privacy extensions put several addresses of one /64 on a machine — one entry is enough
   for (const [name, addrs] of Object.entries(ifaces)) {
     for (const a of addrs || []) {
-      const ip = a.address;
       if (a.internal) continue;
+      const ip = a.address;
       if (a.family === 'IPv4' || a.family === 4) {
         let kind;
         if (inCidr(ip, '169.254.0.0', 16)) kind = 'linklocal';
@@ -227,6 +230,19 @@ async function main() {
   row(vendor.ok ? 'ok' : 'err', '前端库 public/vendor', vendor.ok ? (vendor.optionalMissing.length ? 'three.js 缺失（3D 棋盘回退 2D）' : '') : `缺少 ${vendor.missing.join(', ')} → node tools/vendor.mjs`);
   const data = checkData();
   row(data.ok ? 'ok' : 'err', '游戏数据 data/*.json', data.ok ? '' : `缺少/损坏：${[...data.missing, ...data.broken].join(', ')}`);
+  // the release's file list (every package has one; art is setup's and is checked below)
+  const inst = checkInstall(ROOT);
+  const instLabel = `文件校验 ${MANIFEST_FILE}`;
+  if (inst.state === 'none') row('skip', instLabel, '没有：源码目录，不校验');
+  else if (inst.state === 'broken') row('warn', instLabel, `无法读取（${inst.error}）→ 重新解压同一版本的整合包`);
+  else if (inst.state === 'ok') row('ok', instLabel, `${inst.checked} 个文件与 v${inst.app} 一致`);
+  else {
+    const bad = [...inst.runtime, ...inst.other];
+    const eg = bad.slice(0, 3).join(' ') + (bad.length > 3 ? ' …' : '');
+    row(inst.runtime.length ? 'err' : 'warn', instLabel, `${bad.length} 个文件与 v${inst.app} 不一致或缺失（例：${eg}）`
+      + (inst.runtime.length ? ` → 重新解压 v${inst.app} 的完整包（或它的更新包）` : '：只是说明 / 脚本文件，不影响运行'));
+  }
+  if (inst.pending) row('warn', `更新包 ${UPDATE_FILE}`, '已解压、还没有应用：下次启动服务器时自动应用');
   const assets = checkAssets();
   row(assets.ok ? 'ok' : 'warn', '美术/音频 public/assets', assets.ok ? `${assets.total} 个文件`
     : !assets.present ? '未下载 → node tools/setup.mjs（游戏仍可运行，使用占位图）' : `缺 ${assets.missing}/${assets.total}（例：${assets.sample.join(' ')}）→ node tools/setup.mjs`);
@@ -255,12 +271,13 @@ async function main() {
 
   section('朋友如何访问');
   const addrs = classifyAddresses();
-  if (!addrs.length) row('warn', '网络', '没有可用的 IPv4 地址（未联网？）');
+  if (!addrs.length) row('warn', '网络', '没有可用的地址（未联网？）');
   for (const a of addrs) {
     const usable = a.kind === 'lan' || a.kind === 'vpn' || a.kind === 'public';
-    row(usable ? 'ok' : 'skip', `http://${a.address}:${opts.port}`, `${KIND_LABEL[a.kind]} · ${a.name}`);
+    // An IPv6 literal needs the brackets of hostUrl(): `http://240e:…:3000` is not a URL anyone can open.
+    row(usable ? 'ok' : 'skip', hostUrl(a.address, opts.port), `${KIND_LABEL[a.kind]} · ${a.name}`);
   }
-  if (opts.host !== '0.0.0.0' && opts.host !== '::') row('warn', 'HOST', `HOST=${opts.host}：只监听这个地址，其他电脑可能连不上（默认 0.0.0.0）`);
+  if (opts.host !== '0.0.0.0' && opts.host !== '::') row('warn', 'HOST', `HOST=${opts.host}：只监听这个地址，其他电脑可能连不上（默认 :: 双栈，见 docs/IPV6.md）`);
 
   section('防火墙');
   for (const [m, text] of firewallHints(opts.port)) rows.push([m === '' ? 'raw' : 'mark', text, '', m]);

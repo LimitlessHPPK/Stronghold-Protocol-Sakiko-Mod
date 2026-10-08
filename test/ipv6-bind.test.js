@@ -1,18 +1,22 @@
-// test/ipv6-bind.test.js — the dual-stack default (v0.1.3+).
+// test/ipv6-bind.test.js — the dual-stack default (docs/IPV6.md).
 //
 // The server binds '::' when neither `opts.host` nor `HOST` is set: Node keeps `ipv6Only` off for `::`, so ONE socket
 // answers IPv6 *and* IPv4. That is what lets a household with a public IPv6 prefix be reachable without a tunnel, a
 // second listener or a port forward (IPv6 has no NAT — only the inbound firewall matters), while every existing IPv4
-// setup keeps working exactly as before.
+// setup keeps working exactly as before. 0.2.0 split the entry point, so the default lives in server/http/config.js
+// (`DEFAULT_BIND_HOST` / `bindCandidates`), the address list in server/http/boot.js (`lanUrls`) and the URL shape in
+// tools/doctor.mjs (`hostUrl`).
 //
-// Two things this file pins down:
-//   * the defaults really are '::' in every entry point (server, the Windows runner/installer, the launcher, doctor,
-//     the Dockerfile, the README table) — a revert to '0.0.0.0' should turn up here;
+// Three things this file pins down:
+//   * the defaults really are '::' in every entry point (server config, the Windows runner/installer, the launcher,
+//     doctor, the Dockerfile, the README table) — a revert to '0.0.0.0' should turn up here;
 //   * an IPv6 literal is never handed out as a URL without brackets: `http://240e:…:3000` is not something a browser
-//     (or a friend) can open.
+//     (or a friend) can open, and doctor.mjs / launch.mjs / the banner all go through hostUrl() / lanUrls();
+//   * the fallback that keeps a host without IPv6 booting: only the default is retried, on the three errors that mean
+//     "this kernel has no IPv6", and the returned `host` is the address that was really bound.
 //
 // Address handling itself (the `::ffff:` IPv4-mapped form, /64 limit keys, local/private detection) lives in
-// server/net.js and is covered by test/lobby.test.js.
+// server/net.js and is covered by test/lobby.test.js; the classification is covered by test/doctor.test.js.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,19 +26,39 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { classifyAddresses, hostUrl } from '../tools/doctor.mjs';
+import { DEFAULT_BIND_HOST, listenAddress, bindCandidates } from '../server/http/config.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const doc = (p) => readFileSync(join(ROOT, p), 'utf8');
 
 test('every entry point defaults to the dual-stack bind', () => {
-  assert.match(doc('server/index.js'), /export const DEFAULT_BIND_HOST = '::';/);
-  assert.match(doc('server/index.js'), /opts\.host \|\| process\.env\.HOST\) \|\| DEFAULT_BIND_HOST/);
+  // both files are checked because the default moved into http/config.js in 0.2.0 while the banner stayed in boot.js
+  assert.match(doc('server/http/config.js'), /export const DEFAULT_BIND_HOST = '::';/);
+  assert.match(doc('server/http/config.js'), /opts\.host \|\| process\.env\.HOST\) \|\| DEFAULT_BIND_HOST/);
+  assert.match(doc('server/http/boot.js'), /for \(const u of lanUrls\(srv\.port\)\)/);
   assert.match(doc('scripts/run-server.cmd'), /^\s*set "HOST=::"$/m);
   assert.match(doc('scripts/install-service-windows.ps1'), /\[string\]\$BindHost = '::',/);
   assert.match(doc('scripts/launch.mjs'), /process\.env\.HOST \|\| '::'/);
   assert.match(doc('tools/doctor.mjs'), /process\.env\.HOST \|\| '::'/);
   assert.match(doc('Dockerfile'), /HOST=::/);
   assert.match(doc('README.md'), /\| `HOST` \| `::` \|/);
+});
+
+test('listenAddress: the option wins over the environment, the environment over the default', () => {
+  // process.env.HOST is whatever this machine set, so the no-option case is only asserted when it is unset (the
+  // dual-stack test below clears it on purpose and goes all the way through startServer()).
+  if (!process.env.HOST) assert.deepEqual(listenAddress({}), { port: 3000, host: DEFAULT_BIND_HOST });
+  assert.equal(listenAddress({ port: 0 }).port, 0, 'port 0 is a real port (an ephemeral one)');
+  assert.equal(listenAddress({ host: '127.0.0.1' }).host, '127.0.0.1', 'the option wins');
+  assert.equal(listenAddress({ host: '' }).host, DEFAULT_BIND_HOST, 'an empty host is no host');
+  assert.throws(() => listenAddress({ port: 70000 }), RangeError);
+});
+
+test('bindCandidates: only the default is retried, an explicit host is literal', () => {
+  assert.deepEqual(bindCandidates(DEFAULT_BIND_HOST), ['::', '0.0.0.0'], 'the default falls back to IPv4 only');
+  assert.deepEqual(bindCandidates('0.0.0.0'), ['0.0.0.0'], 'HOST=0.0.0.0 asks for IPv4, not for a retry');
+  assert.deepEqual(bindCandidates('127.0.0.1'), ['127.0.0.1']);
+  assert.deepEqual(bindCandidates('192.168.1.7'), ['192.168.1.7']);
 });
 
 test('hostUrl: only an IPv6 literal gets brackets', () => {

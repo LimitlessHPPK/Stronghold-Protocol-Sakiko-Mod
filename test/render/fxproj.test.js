@@ -18,6 +18,7 @@ import * as SIM from '../../server/sim/constants.js';
 import { installFakePixi, fakeViewCtx } from './fakepixi.js';
 import { presetCamera } from '../../public/js/render/projection.js';
 import { PROJ, HIT_TINT } from '../../public/js/render/style.js';
+import { UF } from '../../shared/constants.js';
 
 let fake, FX, T;
 before(async () => {
@@ -354,6 +355,23 @@ describe('蕾缪安 S3: lock, bombardShell, bombard', () => {
     assert.equal(fx.locks.length, 0);
   });
 
+  test('a held S3 lock (fx `hold`) waits as long as her skill runs with nothing in range, then LOCK_T after it ends; an unheld lock still times out', () => {
+    // 0.2.0 community report: S3 no longer ends by itself with nothing in her range — it waits with its bullets and locks
+    const { fx, lem } = setup();
+    lem.flags = UF.SKILL;                               // her S3 runs (the snapshot's skill bit)
+    fx.simFx('lock', 8, 10, { id: 21, src: 1, hold: 1 });
+    fx.simFx('lock', 9, 11.5, { id: 23, src: 1 });      // an S2 aim lock: no hold
+    const [held, plain] = fx.locks;
+    run(fx, 20 / 2);                                    // 20 game s at 2×, nothing new from her
+    assert.ok(fx.locks.includes(held) && held.out < 0, 'the held reticle stays while her skill waits');
+    assert.ok(!fx.locks.includes(plain), 'the unheld one timed out after LOCK_T');
+    lem.flags = 0;                                      // the skill ended
+    run(fx, 4 / 2);
+    assert.ok(held.out < 0, 'LOCK_T counts from the skill end');
+    run(fx, 1 / 2 + 0.3);
+    assert.equal(fx.locks.length, 0, 'gone LOCK_T after the skill ended (no shell came)');
+  });
+
   test('a lock sticks to the enemy named in `id` even when its view is a little off the event spot', () => {
     const { fx, e1 } = setup();
     fx.simFx('lock', 9, 10, { id: 21, src: 1 });   // e1 drawn at (8, 10): a fast walker between snapshots
@@ -426,30 +444,6 @@ describe('fx placement, quality, melee, skill', () => {
     assert.equal(fx._slashAt, null);
     fx.damage(b, 300, 'phys', a);                    // a second hit without a new blow: no slash
     assert.equal(liveTex(fx, 'slash').length, 2);
-  });
-
-  test("a ranged 'none' attack is no slash either — the content's own visual is the whole attack", () => {
-    // ai.js reports 'none' for a profile with no projectile visual of its own. For a MELEE profile that is the blow
-    // above; for a RANGED one (丰川祥子's note-carrying normal attack, collab.js `noAttackVis`) a crescent swept at
-    // the victim would be a blade effect at range. ctx.rangedOf is the renderer's own range-class lookup (app.js
-    // data.chess(defId).attackKind).
-    const a = unit(1, 4, 10), b = unit(2, 9, 10, { isEnemy: true });
-    const ranged = makeFx({ views: [a, b] });
-    ranged.fx.ctx.rangedOf = () => true;
-    ranged.fx.attack(a, b, 'none');
-    assert.equal(ranged.fx.projs.length, 0, 'no projectile sprite');
-    assert.notEqual(ranged.fx._slashAt, a.id, 'and no pending slash');
-    ranged.fx.damage(b, 300, 'phys', a);                 // the damage lands with no slash to sweep
-    assert.equal(liveTex(ranged.fx, 'slash').length, 0);
-    // a 'none' from an attacker the renderer does not know as ranged keeps its slash (every melee operator)
-    const melee = makeFx({ views: [a, b] });
-    melee.fx.ctx.rangedOf = () => false;
-    melee.fx.attack(a, b, 'none');
-    assert.equal(melee.fx._slashAt, a.id);
-    // …and a context without the lookup at all (an older harness) behaves exactly as it did before
-    const older = makeFx({ views: [a, b] });
-    older.fx.attack(a, b, 'none');
-    assert.equal(older.fx._slashAt, a.id);
   });
 
   test('skill activation bursts (pillars, flare, shockwave + hex) and keeps an aura until it ends', () => {

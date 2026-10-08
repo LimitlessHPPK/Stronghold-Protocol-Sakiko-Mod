@@ -9,10 +9,10 @@
 //     arc atlas are both gone. 蓄满 (100 %) and the Fever state still read apart from plain charging — the arc lights up
 //     (higher alpha) and the halo breathes at 蓄满, the arc AND the track take FEVER_ROSE_HI and the halo breathes
 //     harder while Fever is ON, and the unit's SP bar turns the same rose until Fever ends. There is NO threshold tick
-//     any more (the trigger is 蓄满, not 50 %).
+//     (the trigger is 蓄满, not 50 %).
 //   * nothing is drawn without the field (an older server / a recording), in prep, or on a dead unit
-// The whole client path is also run for real: a battle whose snapshots carry a synthetic `fever` field, pushed through
-// render/interp.js exactly as render/app.js does, into a UnitView.
+// The whole client path is also run for real: her sim gauge (b.snap `fever`, written by the kit's `mem.gauges.fever`)
+// pushed through render/interp.js exactly as render/app.js does, into a UnitView.
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,13 +31,14 @@ before(async () => {
 after(() => fake.restore());
 
 const cam = () => presetCamera('normal', { width: 1280, height: 720 });
-const SAKIKO = 'char_4182_oblvns';        // her char id (UnitInfo.defId, the HUD's own key)
-const SAKIKO_CHESS = 'chess_char_6_21_a'; // her chess record (what a battle is built with)
+const SAKIKO = 'char_4182_oblvns';             // her charId (the 自选 slot's pick)
+const SLOT = 'chess_char_6_diy1_a';            // the tier-6 自选 slot she is fielded in (0.2.0's DIY model)
+const PICK = { charId: SAKIKO, skillIndex: 0, uniEquipId: null };
 
 /** A battle-side UnitView of 祥子 (its HUD is what these tests look at). */
 function view({ quality = 'high', info = {} } = {}) {
   const ctx = fakeViewCtx(fake.P, { cam, settings: { damageNumbers: true, quality } });
-  return new UnitView(ctx, { id: 1, side: 'ally', kind: 'chess', defId: SAKIKO, tier: 6, x: 5, y: 12, maxHp: 3000, ...info });
+  return new UnitView(ctx, { id: 1, side: 'ally', kind: 'chess', defId: SLOT, diy: { ...PICK }, tier: 6, x: 5, y: 12, maxHp: 3000, ...info });
 }
 
 /** A snapshot sample as render/interp.js sample() hands it over (only the HUD's fields matter here). */
@@ -78,7 +79,7 @@ describe('interp: the snapshot `fever` list', () => {
 });
 
 describe('the Fever badge on the unit', () => {
-  test('the badge sits at the model\'s bottom-right, not in the bars row, and rides the unit', () => {
+  test("the badge sits at the model's bottom-right, not in the bars row, and rides the unit", () => {
     const v = view();
     const s = 40;                                   // px per tile of this camera at the unit's tile
     const r = draw(v, sample({ fever: 40 }));
@@ -94,7 +95,6 @@ describe('the Fever badge on the unit', () => {
     const r2 = draw(v, sample({ fever: 40, x: 9, y: 8 }), 1);
     assert.equal(r2, r, 'the same badge');
     const p = cam().project(9, 8, 0);
-    assert.ok(Math.abs((r.root.x - p.x) - (r.root.x - v.screen.x)) < 1e-6 || true);
     assert.ok(Math.abs(r.root.x - (p.x + FEVER_ICON.dx * p.s + r.arc.width * 0.3)) < 1e-6, 'anchored to the new feet');
     assert.ok(Math.abs(r.root.y - (p.y - FEVER_ICON.dy * p.s - r.arc.width * 0.3)) < 1e-6);
   });
@@ -194,7 +194,7 @@ describe('the Fever badge on the unit', () => {
   });
 
   test('prep and a dead unit show no badge', () => {
-    const p = new UnitView(fakeViewCtx(fake.P, { cam, settings: { quality: 'high' } }), { id: 1, side: 'ally', kind: 'chess', defId: SAKIKO, tier: 6, x: 5, y: 12, maxHp: 3000 }, { prep: true });
+    const p = new UnitView(fakeViewCtx(fake.P, { cam, settings: { quality: 'high' } }), { id: 1, side: 'ally', kind: 'chess', defId: SLOT, diy: { ...PICK }, tier: 6, x: 5, y: 12, maxHp: 3000 }, { prep: true });
     p.sync(sample({ fever: 50 }), 0);
     p.update(1 / 60, cam(), 0);
     assert.ok(!p._feverIcon || !p._feverIcon.root.visible, 'prep has no battle HUD');
@@ -211,7 +211,7 @@ describe('the Fever badge on the unit', () => {
     assert.equal(r.arc.tint, FEVER_ROSE, 'charging: the plain rose');
     assert.equal(r.track.tint, FEVER_ROSE_DIM, '…over the dimmed track');
     assert.equal(v.feverActive(), false);
-    v.onStatus('sakiko:fever', true);          // the sim's visible Fever buff (content/kits/collab.js)
+    v.onStatus('sakiko:fever', true);          // the sim's visible Fever buff (kits/ops/op-oblvns.js)
     assert.equal(v.feverActive(), true);
     // while Fever is ON the sim sends the REMAINING TIME (100 → 0): the ring falls
     draw(v, sample({ fever: 100 }), 1);
@@ -299,7 +299,7 @@ describe('the Fever badge on the unit', () => {
     const sizes = [];
     for (const [w, h] of [[320, 200], [1280, 720], [2560, 1440]]) {
       const c = () => presetCamera('normal', { width: w, height: h });
-      const v = new UnitView(fakeViewCtx(fake.P, { cam: c, settings: { quality: 'high' } }), { id: 1, side: 'ally', kind: 'chess', defId: SAKIKO, tier: 6, x: 5, y: 12, maxHp: 3000 });
+      const v = new UnitView(fakeViewCtx(fake.P, { cam: c, settings: { quality: 'high' } }), { id: 1, side: 'ally', kind: 'chess', defId: SLOT, diy: { ...PICK }, tier: 6, x: 5, y: 12, maxHp: 3000 });
       v.sync(sample({ fever: 60 }), 0);
       v.update(1 / 60, c(), 0);
       const r = v._feverIcon;
@@ -314,48 +314,14 @@ describe('the Fever badge on the unit', () => {
 });
 
 describe('the whole client path (battle → snapshot → interp → view)', () => {
-  test('祥子 in a real battle with a synthetic `fever` field: the badge is that gauge', () => {
-    const h = makeBattle({ units: [{ chessId: SAKIKO_CHESS, row: 10, col: 5 }], seed: 5, autoFinish: false, timeLimit: 600 });
-    h.runUntil(() => h.allies().length > 0, 60);   // she costs DP: deployed a few seconds in
-    const u = h.allies()[0];
-    assert.ok(u, 'the operator deployed');
-    const info = h.b.fieldMeta().units.find((x) => x.id === u.id);
-    const v = new UnitView(fakeViewCtx(fake.P, { cam, settings: { quality: 'high' } }), info);
-    const buf = new SnapshotBuffer({ delay: 0.034, rate: 2, maxRate: 8 });
-    const out = new Map();
-    const seen = [];
-    for (let i = 0; i < 60; i++) {
-      h.step();
-      const snap = h.b.snapshot();
-      const pct = [0, 3, 24, 49, 50, 51, 100][i % 7];
-      // the field the server sends (sim Battle.snapshot): [[unitId, pct], …] — this run fabricates the numbers
-      buf.push({ ...snap, gt: snap.t, fever: [[u.id, pct]] }, (i + 1) / 60);
-      const rt = buf.update((i + 1) / 60);
-      buf.sample(rt, out);
-      const s = out.get(u.id);
-      if (!s) continue;
-      v.sync(s, rt);
-      v.update(1 / 60, cam(), (i + 1) / 60);
-      const r = v._feverIcon;
-      const shown = buf.snaps[Math.max(0, buf._indexAt(rt))];
-      const want = shown.fever.get(u.id);
-      assert.equal(s.fever, want, 'the sample carries the snapshot\'s gauge');
-      assert.ok(r && r.root.visible, 'the badge shows');
-      assert.equal(arcIndex(r.arc.texture), arcIndex(ringArc(want / 100)), `pct ${want}: the ring`);
-      if (!v.feverActive()) assert.ok(r.arc.alpha <= 1 + 1e-9 || want >= 100, `pct ${want}: the lit arc is the 蓄满 mark`);
-      seen.push(want);
-    }
-    assert.ok(seen.includes(100) && seen.includes(0), 'the run covered empty and full');
-    assert.ok(seen.length > 50, `the operator was rendered most ticks (${seen.length})`);
-  });
-
-  test('the sim\'s own gauge (snap.fever, no fabrication): it charges as she deals damage and the badge follows', () => {
-    // the real thing: 祥子 in front of an immortal dummy charges her talent (sim content/kits/collab.js)
+  test("祥子's own sim gauge (snap.fever, no fabrication): it charges as she deals damage and the badge follows", () => {
+    // the real thing: 丰川祥子 (a 自选 slot + its pick) in front of an immortal dummy charges her talent's gauge
+    // (server/sim/content/kits/ops/op-oblvns.js) and Battle.snapshot publishes it as [[unitId, pct], …].
     const h = makeBattle({
       seed: 7, autoFinish: false, timeLimit: 400,
-      units: [{ chessId: SAKIKO_CHESS, row: 10, col: 4, carryState: { sp: 999 } }],
-      enemies: [{ key: 'e_dummy', pos: [10, 6] }],
-      defs: { enemies: { e_dummy: enemyRec({ key: 'e_dummy', hp: 1e7, speed: 0, def: 0, res: 0 }) } },
+      units: [{ uid: 1, diy: { slot: SLOT, charId: SAKIKO, skillIndex: 0, uniEquipId: null }, row: 10, col: 4, dir: 'RIGHT' }],
+      enemies: [{ key: 'enemy_dummy', pos: [10, 6] }],
+      defs: { enemies: { enemy_dummy: enemyRec({ key: 'enemy_dummy', hp: 1e7, speed: 0, def: 0, res: 0 }) } },
     });
     h.runUntil(() => h.allies().length > 0, 60);
     const u = h.allies()[0];
@@ -365,7 +331,8 @@ describe('the whole client path (battle → snapshot → interp → view)', () =
     const buf = new SnapshotBuffer({ delay: 0.034, rate: 2, maxRate: 8 });
     const out = new Map();
     const seen = [];
-    for (let i = 0; i < 15 * 60; i++) {
+    let fullFrames = 0;
+    for (let i = 0; i < 40 * 60; i++) {          // her gauge charges slowly (~3 %/s here): 40 s cover 0 → 100
       h.step();
       const snap = h.b.snapshot();
       if (!snap.fever) continue;                       // nothing to draw before the first charge
@@ -383,11 +350,17 @@ describe('the whole client path (battle → snapshot → interp → view)', () =
       assert.ok(r && r.root.visible, 'the badge shows');
       assert.equal(arcIndex(r.arc.texture), arcIndex(ringArc(s.fever / 100)), `the ring is the gauge (${s.fever} %)`);
       if (s.fever > 0 && !v.feverActive()) assert.equal(r.arc.tint, FEVER_ROSE, 'charging rose');
-      assert.ok(s.fever <= want + 1e-9, `drawn ${s.fever} ≤ sim ${want}`);
+      // 蓄满 (100 %) reads by the lit ring (and the halo, above this test's scope): the badge's own ready mark
+      if (s.fever >= 100) { fullFrames++; assert.ok(r.arc.alpha > 1, 'the filling ring lights up at 蓄满'); }
+      // the sample's gauge is the snapshot shown at renderT, not a fabricated number (the gauge both charges and, once
+      // the state starts, counts DOWN, so it is not monotonic: compare with the shown snapshot, not with the newest)
+      const shown = buf.snaps[Math.max(0, buf._indexAt(rt))];
+      assert.equal(s.fever, shown.fever.get(u.id), `the sample carries the shown snapshot's gauge (${s.fever})`);
       seen.push(s.fever);
     }
-    assert.ok(seen.length > 600, `she carries a gauge for most of the run (${seen.length} frames)`);
+    assert.ok(seen.length > 1200, `she carries a gauge for most of the run (${seen.length} frames)`);
     assert.ok(seen.some((p) => p > 0 && p < 50), 'it is seen charging through the first half');
-    assert.ok(seen.some((p) => p >= 50), `it passes the old 50 % mark (max ${Math.max(...seen)})`);
+    assert.ok(seen.some((p) => p >= 50), `it passes the 50 % mark (max ${Math.max(...seen)})`);
+    assert.ok(fullFrames > 0, `the run reached 蓄满 (${fullFrames} frames at 100 %)`);
   });
 });

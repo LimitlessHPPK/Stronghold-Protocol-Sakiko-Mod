@@ -7,8 +7,8 @@
 // `steer(p, dt) → boolean` hands ONE projectile's movement to its content: the system then calls it every step
 // instead of the straight-line move (returning true = the arrival, so `onHit` runs as usual). 丰川祥子's notes need
 // it — their flight is the official 【自由移动】/【追踪移动】/【已命中】 state machine with a 扩张正弦 drift and a turn
-// speed, none of which a "fly straight at tx,ty" move can express (server/sim/content/kits/collab.js). Everything
-// else — id, age/maxAge, data, visual, target fizzle — stays the system's.
+// speed, none of which a "fly straight at tx,ty" move can express (server/sim/content/kits/ops/op-oblvns.js).
+// Everything else — id, age/maxAge, data, visual, target fizzle — stays the system's.
 
 import { PROJECTILE_SPEED } from './constants.js';
 

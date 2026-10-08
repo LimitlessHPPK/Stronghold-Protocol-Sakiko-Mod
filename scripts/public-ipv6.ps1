@@ -17,10 +17,10 @@
     测 TCP → 拉一次 /healthz 确认对面真是这个游戏 → 打开浏览器
 
   为什么要做这个：v0.1.3 的启动窗口和 node tools\doctor.mjs 只列 IPv4 地址，开服的人
-  看不到自己的公网 IPv6 是多少。v0.1.4 起 server/index.js、scripts\launch.mjs 和
-  tools\doctor.mjs 都已经能给出 IPv6（默认 HOST=:: 双栈，见 docs/IPV6.md），但那些入口
-  只是「列出来」；这个脚本仍然负责一键菜单、防火墙放行、开机自启和「朋友那边能不能连」
-  的自检，所以照旧有用。
+  看不到自己的公网 IPv6 是多少。v0.1.4 起 server/http/config.js（HOST 默认 ::）、
+  server/http/boot.js（LAN/公网地址清单）、scripts\launch.mjs 和 tools\doctor.mjs 都已经
+  能给出 IPv6（默认 :: 双栈，见 docs/IPV6.md），但那些入口只是「列出来」；这个脚本仍然
+  负责一键菜单、防火墙放行、开机自启和「朋友那边能不能连」的自检，所以照旧有用。
 
   前提：双方宽带都要有 IPv6（国内三大运营商的家宽基本都有，手机流量也有）。
 #>
@@ -418,8 +418,7 @@ function Invoke-Serve([int]$p, [bool]$OnlyFirewall, [bool]$NoStartServer, [bool]
   try {
     $env:HOST = '::'
     $env:PORT = "$p"
-    & node scripts\launch.mjs --host '::' --port "$p"
-    return $LASTEXITCODE
+    & node scripts\launch.mjs --host '::' --port "$p"    return $LASTEXITCODE
   } finally {
     Pop-Location
   }

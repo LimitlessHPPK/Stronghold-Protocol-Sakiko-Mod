@@ -12,6 +12,9 @@
 # 判断标准（docs\DEPLOY.md 2.5）：
 #   * 显示「连不上 / 超时」→ 入站被静默丢弃，多半是光猫 / 路由器的 IPv6 防火墙（不是电脑的问题）；
 #   * 显示 200 与版本号 → 通了，把 -Address 显示的那个地址发给朋友即可。
+#
+# 服务器那边的默认绑定就是 '::' 双栈（server/http/config.js DEFAULT_BIND_HOST），所以这里不用改任何配置，
+# 只要 Windows 防火墙放行了端口（scripts\public-ipv6.ps1 -Firewall，或 docs\IPV6.md）。
 
 [CmdletBinding()]
 param(

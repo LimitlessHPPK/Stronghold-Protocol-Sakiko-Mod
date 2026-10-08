@@ -1,12 +1,12 @@
 // The two dubs of a battle voice line: plan.mjs VOICE_LANG_OVERRIDE + tools/fetch-voice-override.mjs.
 //
-// 丰川祥子 (char_4182_oblvns), the Ave Mujica collaboration operator this repo adds locally, has NO Chinese battle voice
-// anywhere upstream: `voice_cn/char_4182_oblvns/cn_019.mp3` … `cn_032.mp3` answer 404 for all fourteen lines while the JP
-// dump `voice/` carries every one of them (the whole collaboration is like that — 祐天寺若麦 / 三角初华 / 若叶睦 too;
-// docs/research/12-sakiko.md §6.5). So `--voice-lang=cn` is not a decision anyone can make for her, and the manifest
+// 丰川祥子 (char_4182_oblvns), the Ave Mujica collaboration operator this repo adds locally as a 自选 (diy) pick, has NO
+// Chinese battle voice anywhere upstream: `voice_cn/char_4182_oblvns/cn_019.mp3` … `cn_032.mp3` answer 404 for all
+// fourteen lines while the JP dump `voice/` carries every one of them (the whole collaboration is like that —
+// 祐天寺若麦 / 三角初华 / 若叶睦 too). So `--voice-lang=cn` is not a decision anyone can make for her, and the manifest
 // cannot simply advertise a CN path that 404s: her entries are planned against the JP dump and the files are fetched by
 // tools/fetch-voice-override.mjs — the project's own downloader cannot reach them here (no jsDelivr mirror for the voice
-// branch, raw.githubusercontent.com is a black hole on this machine: AGENTS.md §3.1–3.2).
+// branch, raw.githubusercontent.com is a black hole on a machine whose hosts file blocks it).
 //
 // Covered: the override table itself, the jobs the script derives from `charword_table.json`, the download order it uses
 // (the project's `--asset-source=mirror` policy) and the summary note tools/fetch-assets.mjs prints instead of claiming

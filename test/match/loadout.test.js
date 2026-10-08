@@ -33,8 +33,7 @@ function place(m, ps, chessId, row, col) {
 // ---- shared checks -------------------------------------------------------------------------------------------------
 
 test('data carries the §16 choices every visible chess needs (skills at both statuses, elite modules + none)', () => {
-  // 112 official + 丰川祥子, injected by tools/inject-sakiko.mjs (docs/research/12-sakiko.md)
-  assert.equal(visible.length, 113);
+  assert.equal(visible.length, 112);
   for (const c of visible) {
     const g = chess(c.goldenId);
     const o = loadoutOptions(c, g);

@@ -165,7 +165,7 @@ export const FEVER_ROSE_DIM = 0x6d2139;
  *          boomerang = BOOMERANG_RETURN_SPEED, PRTS 跃跃: out 15, back 3.75). fx.js prefers the sim's own values, loaded
  *          from /sim/constants.js, so the visual flight ends with the sim's hit; this copy stands in until then (and in
  *          Node). test/render/fxproj.test.js keeps the two equal. (`note` / `noteSkill` are not in the sim's table:
- *          their speed copies the note flight of server/sim/content/kits/collab.js.)
+ *          their speed copies the note flight of server/sim/content/kits/ops/op-oblvns.js.)
  *   sizes  in tiles (× the camera's px per tile at the shot): `len` trail length, `width` trail thickness, `head` glow
  *          diameter; `arc` peak height of a lob over a 3-tile throw (scales with the range). A note's `look` has no
  *          trail: `head` / `width` are its glyph's height / width and `halo` its glow's diameter (NOTE_SIZE)
@@ -174,13 +174,14 @@ export const FEVER_ROSE_DIM = 0x6d2139;
  *   once   a one-off cast, not an attack rhythm: the shooter's attack clip plays once at its own speed (render/spine.js
  *          SpineActor.attack / windUp) — 暴鸰's bomb drop
  *
- * `note` / `noteSkill` are 丰川祥子's notes (server/sim/content/kits/collab.js `battle.addProjectile({ visual: 'note' })`).
- * She fires them on her own — 【自由移动】 when nothing is in range, then 【追踪移动】 — so there is NO 'atk' event to
- * hang a visual on and no target view to home on: the sim streams their positions in `b.snap.proj` and render/fx.js
- * draws them from that list (FxSystem.syncNotes, one sprite per projectile id). Each note picks one of three glyphs at
- * random when it appears and keeps it (fx.js NOTE_FRAMES); `kind` tells the two kinds apart — her skill's notes
- * ('noteSkill') are bigger and brighter than the talent's ('note'). `look: 'note'` is still handled by
- * _dressProj / _stepShot, so a note that ever does arrive as an 'atk' kind flies and lands like the others.
+ * `note` / `noteSkill` are 丰川祥子's notes (server/sim/content/kits/ops/op-oblvns.js `fireNote`). She fires them on her
+ * own — 【自由移动】 when nothing is in range, then 【追踪移动】 — so there is NO 'atk' event to hang a visual on and no
+ * target view to home on: the sim streams their positions in `b.snap.proj` and render/fx/notes.js draws them from that
+ * list (FxSystem.syncNotes, one sprite per projectile id). Each note picks one of three glyphs at random when it appears
+ * and keeps it (notes.js NOTE_FRAMES); `kind` tells the two kinds apart — her skill's notes ('noteSkill') are bigger and
+ * brighter than the talent's ('note'). `look: 'note'` is still handled by _dressProj / _stepShot, so a note that ever
+ * does arrive as an 'atk' kind flies and lands like the others. Her ordinary attack reports `vis: 'none'` on that event
+ * (`noAttackVis`), so no made-up note is drawn on top of the real one coming from `snap.proj`.
  */
 export const PROJ = Object.freeze({
   arrow: { look: 'tracer', speed: 14, tint: 0xfff6dc, glow: 0xffc45a, len: 1.05, width: 0.2, head: 0.36, muzzle: 0xffd27a, hit: 'spark' },
@@ -191,14 +192,14 @@ export const PROJ = Object.freeze({
   drone: { look: 'dart', speed: 16, tint: 0xe4fbff, glow: 0x57c9ff, len: 0.7, width: 0.16, head: 0.3, trail: 0x57c9ff, hit: 'zap' },
   enemy: { look: 'orb', speed: 10, tint: 0xffe2da, glow: 0xff3b30, len: 0.55, width: 0.28, head: 0.44, trail: 0xff4a3a, muzzle: 0xff6a5a, hit: 'enemy' },
   boomerang: { look: 'boomerang', speed: 15, back: 3.75, tint: 0xfff4d6, glow: 0x9ff0dc, len: 0.4, width: 0.3, head: 0.5, trail: 0x9ff0dc, hit: 'spark' },
-  // 暴鸰's bomb (sim content/enemies.js kitBombd; official projectile_bombd, speed 5): dropped from the drone, it falls
+  // 暴鸰's bomb (sim content/enemies/fly.js kitBombd; official projectile_bombd, speed 5): dropped from the drone, it falls
   // onto its target with a low arc and bursts where the sim's 'explode' blast goes off
   droneBomb: { look: 'shell', speed: 5, once: true, tint: 0xffe2c8, glow: 0xff5a3a, len: 0.6, width: 0.3, head: 0.5, trail: 0xff7a4a, arc: 0.35, smoke: 0x2e2824, hit: 'boom' },
-  // 丰川祥子's talent note (collab.js fireNote, hitTag 'talent'): a floating music glyph — 八分音符 / 十六分音符 /
-  // 高音谱号, picked at random per note (fx.js NOTE_FRAMES) — with a halo in the effect colour. Sizes: NOTE_SIZE.talent,
-  // colours: NOTE_INK.talent (glyph) / NOTE_FX (halo, trail, sparks). `speed` copies the note's own flight (collab.js,
-  // 【追踪移动】2 tiles/s) and is only read if a note ever arrives as an 'atk' kind — the live path is `b.snap.proj` →
-  // fx.js syncNotes, which draws the sim's own positions instead.
+  // 丰川祥子's talent note (op-oblvns.js fireNote, `hitTag` 'talent'): a floating music glyph — 八分音符 / 十六分音符 /
+  // 高音谱号, picked at random per note (notes.js NOTE_FRAMES) — with a halo in the effect colour. Sizes: NOTE_SIZE.talent,
+  // colours: NOTE_INK.talent (glyph) / NOTE_FX (halo, trail, sparks). `speed` copies the note's own flight (op-oblvns.js
+  // NOTE_TALENT, 【追踪移动】 2 tiles/s) and is only read if a note ever arrives as an 'atk' kind — the live path is
+  // `b.snap.proj` → notes.js syncNotes, which draws the sim's own positions instead.
   note: { look: 'note', speed: 2, tint: NOTE_INK.talent, glow: NOTE_FX, trail: NOTE_FX, ...NOTE_SIZE.talent, hit: 'arts' },
   // the same note fired by one of her skills (hitTag 'skill': S1's volley, S2's two timbres, S3's tracking pair):
   // bigger and brighter (a paler glyph, a wider and stronger halo) so a skill's notes read as the stronger ones
@@ -209,7 +210,7 @@ export const PROJ = Object.freeze({
 export const STATUS_ICON = Object.freeze({
   stun: 'stun', freeze: 'freeze', cold: 'cold', stealth: 'stealth', shield: 'shield', fragile: 'fragile',
   artsFragile: 'fragile', physFragile: 'fragile', elemFragile: 'fragile', sleep: 'sleep', invulnerable: 'invuln',
-  silence: 'silence', slow: 'slow', sluggish: 'slow', bind: 'bind', fear: 'fear', tremble: 'fear', weaken: 'weaken',
+  silence: 'silence', slow: 'slow', sluggish: 'slow', bind: 'bind', groundbind: 'bind', fear: 'fear', tremble: 'fear', weaken: 'weaken',
   levitate: 'levitate', taunt: 'taunt', defDown: 'weaken', resDown: 'weaken', aspdDown: 'slow', disarm: 'silence',
   burn: 'burn', burnBurst: 'burn', neural: 'neural', neuralBurst: 'neural', necrosis: 'necrosis', apoptosis: 'necrosis',
   // a 傀儡师 fighting as its <替身> (sim professions.js buff 'trait:substitute', the 20 s form)
@@ -230,7 +231,7 @@ const STATUS_GUESS = [
 ];
 
 /**
- * The 折射 icon is not drawn while the unit is silenced: the RES bonus is already off (enemies.js refraction)
+ * The 折射 icon is not drawn while the unit is silenced: the RES bonus is already off (sim content/enemies/archetypes.js refraction)
  * and the status must not keep looking active. Other icons stay.
  * @param {string} key a b.ev status key
  * @param {Set<string>|string[]|null} statuses

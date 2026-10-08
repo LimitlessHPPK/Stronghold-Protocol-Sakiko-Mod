@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBattleRunner, keepsState, compactHeld, HELD_MAX, EV_SLICE } from '../../public/js/battle/runner.js';
 import { SnapshotBuffer } from '../../public/js/render/interp.js';
+import { keepEarly } from '../../public/js/screens/game/early.js';
 import { createStore, initialState } from '../../public/js/store.js';
 import * as specMod from '../../server/sim/spec.js';
 import { DataSource } from '../../server/sim/simdata.js';
@@ -234,7 +235,8 @@ test('a hidden-tab backlog still beyond HELD_MAX after compaction: the first fra
 
 test('screens/game.js buffers the form fx with the state-bearing events it replays when a field is entered late', () => {
   const src = readFileSync(path.join(ROOT, 'public/js/screens/game.js'), 'utf8');
-  assert.match(src, /const keepEarly = \(e\) => Array\.isArray\(e\) && \(STATE_EV\.has\(e\[0\]\) \|\| fxForm\(e\) !== undefined\);/);
+  const early = readFileSync(path.join(ROOT, 'public/js/screens/game/early.js'), 'utf8');
+  assert.match(early, /const keepEarly = \(e\) => Array\.isArray\(e\) && \(STATE_EV\.has\(e\[0\]\) \|\| fxForm\(e\) !== undefined\);/);
   assert.match(src, /for \(const e of msg\.ev\) if \(keepEarly\(e\)\) buf\.push\(e\);/);
   // a new m.field for the field on screen buffers its frames until the enter effect re-enters it (enterBattle resets)
   assert.match(src, /if \(msg\.fieldId === lastFieldRef\.current\) reentryRef\.current = msg\.fieldId;/);
@@ -243,24 +245,24 @@ test('screens/game.js buffers the form fx with the state-bearing events it repla
 });
 
 test('entering a field late replays the SAME buffered events to the view and to the sound', () => {
-  // 所有者报告（2026-10-08）「祥子大招音效有时不触发」的另一半根因：这个 effect 曾经把已经按 keepEarly 收好的
-  // `early` 再过滤成只剩 `'spawn'` 才交给音频。部署当刻就发动技能的干员（`initSp` 已够 —— 祥子 S3 是 30/46，
-  // 泥岩、银灰 同样）在 t=0 就发 `['skill', id, 1]`，而那发生在玩家进入这个战场之前，`setFieldUnits` 只教会音频
-  // 「场上有谁」、不告诉它「他们做过什么」——于是那一次发动永远没被播过，后面的都正常（「有时不响」）。
-  // 现在两条路拿到的是同一份、同一顺序：view.pushEvents(early) 与 audio.handleBattleEvents(early)。
+  // The other half of "the first ultimate is sometimes silent": this effect used to take the `early` list keepEarly had
+  // collected and filter it down to its `'spawn'` tuples before handing it to the audio. An operator that casts inside
+  // its deploy tick (`initSp` already at `spCost`, or one deployed into a running battle) emits `['skill', id, 1]` at
+  // t = 0 — before the player entered this field — and `setFieldUnits` above only teaches the sound WHO is on the field,
+  // never what they did, so that one cast was never played while every later one was (the owner's "sometimes"). Both
+  // paths now see one list in one order. (Ported from 0.1.4, where keepEarly still lived in screens/game.js.)
   const src = readFileSync(path.join(ROOT, 'public/js/screens/game.js'), 'utf8');
   assert.match(src, /view\.pushEvents\(early\);/, 'the view gets the buffered list');
   assert.match(src, /audio\.handleBattleEvents\(early\);/, 'and the sound gets that same list');
   assert.ok(!/audio\.handleBattleEvents\(early\.filter\(/.test(src),
     "no second filter: 'spawn'-only replay dropped the deploy-time cast of the battle just entered");
 
-  // the listener's own buffering (state-bearing kinds only), reproduced: what survives for the replay
-  const STATE_EV = new Set(['spawn', 'die', 'deploy', 'status', 'skill']);
-  const keepEarly = (e) => Array.isArray(e) && (STATE_EV.has(e[0]) || fxForm(e) !== undefined);
+  // The listener's own buffering (state-bearing kinds only, screens/game/early.js), the real predicate: what survives
+  // for the replay. The `fx` tuple below is a form change (protocol.js fxForm), kept like every state-bearing kind.
   const stream = [
     ['atk', 1, 2, 'none'],                 // stale cosmetics: dropped (they would look wrong replayed)
     ['dmg', 2, 40, 'phys'],
-    ['spawn', { id: 1, spine: 'char_4182_oblvns', skillIndex: 2 }],
+    ['spawn', { id: 1, spine: 'char_263_skadi', skillIndex: 2 }],
     ['deploy', 1],
     ['skill', 1, 1],                       // ← the deploy-tick cast of the fight the player just entered
     ['skill', 1, 0],
@@ -272,7 +274,8 @@ test('entering a field late replays the SAME buffered events to the view and to 
     'the pre-entry buffer keeps every state-bearing kind');
   assert.deepEqual(early.filter((e) => e[0] === 'spawn').map((e) => e[0]), ['spawn'],
     'the old spawn-only replay threw the cast away — the bug this covers');
-  // the audio side reads exactly these, in this order (its own handlers: spawn → track, skill → cue, die → death sound)
+  // the audio side reads exactly these, in this order (its own handlers: spawn → track the unit, skill → its cue,
+  // die / deploy → their own sound), and a 'skill' whose unit is still unknown is held, not dropped (audio.js)
   const fed = [];
   const audio = { handleBattleEvents: (ev) => fed.push(...ev.map((e) => e[0])) };
   audio.handleBattleEvents(early);
