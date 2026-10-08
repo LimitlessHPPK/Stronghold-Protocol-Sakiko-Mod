@@ -6,7 +6,8 @@
 //   voice { [charId]: { start, faceEnemy, select, place, skill1…skill4, squad, squadFirst, result*, gacha } },
 //   sfx.ui { click, buy, sell, refresh, freeze, levelup, merge, equip, ready, timer, yourTurn, … },
 //   sfx.battle { deploy, tokenDeploy, charDie, tokenDie?, enemyDie, enemyHit, heal, killCoin, … },
-//   sfx.units { [charId|tokenId|enemyId]: { attack?, hit?, skill?, die?, born?, mix?: { [role]: { p?, vol? } } } }.
+//   sfx.units { [charId|tokenId|enemyId]: { attack?, hit?, skill?, die?, born?, mix?, skills?,
+//     skillSfx?: { [skillIndex]: { born?, hit?, finish?, loop? } } } }.
 //
 // - The AudioContext is created on the first user gesture (pointerdown/keydown/touchend), so browsers
 //   never block or warn; everything requested before that is remembered (BGM) or dropped (SFX).
@@ -93,6 +94,16 @@ const IMPACT_TYPES = new Set(['phys', 'arts', 'true']);
 const IMPACT_WINDOW_MS = 2500;
 /** Official operator sound files of a skill mode: `…_d` / `…_h` / `…_s` (+ digits) — the normal attack's end in `_n`. */
 const SKILL_MODE_FILE = /_(d|h|s)\d*\.mp3$/i;
+/**
+ * 持续段循环音 (`sfx.units[id].skillSfx[i].loop`, e.g. 丰川祥子's S3): how long one loop may ring without its skill's end
+ * event, and the fade of a stop. The official data makes the stop a CONTROL action rather than a sound:
+ * `soundFXCtrlBanks` carries `battle.ON_SKILL_FINISH.skchr_oblvns_3 = { targetBank: 'battle.ON_BUFF_START.oblvns_s_3[loop]',
+ * ctrlStop: true, ctrlStopFadetime: 0.2 }` — S3's own `ON_SKILL_FINISH` has no `soundFXBanks` entry at all, so its end
+ * cue IS this fade-out (there is no file to play). The cap is the safety net for an end event this client never sees (a
+ * dropped socket, a replay that starts mid-skill): a loop outliving its skill is the one failure a loop primitive can
+ * have, and the official skill's own duration is 25 s.
+ */
+const SKILL_LOOP_MAX_S = 60, SKILL_LOOP_FADE_S = 0.2;
 
 // ---- pure helpers (unit-tested) -----------------------------------------------------------------------
 
@@ -241,6 +252,35 @@ export function normalAttackSfx(defId, url) {
 }
 
 /**
+ * Per-skill battle sound (`audio.sfx.units[defId].skillSfx[<skillIndex>]`, docs/ASSETS.md "按技能细分的音效"): the cue a
+ * unit's OWN skill plays for a role its unit entry carries only once. Keyed by the skill index the snapshot's UnitInfo
+ * carries (`skillIndex`, the equipped skill's 0-based index — the same key `unit()` reads for `skills[index]`), and read
+ * anywhere a unit sound would otherwise be the only answer:
+ *
+ *   { "skillSfx": { "0": { "hit": "/assets/audio/sfx/…" }, "2": { "finish": "…", "loop": "…" } } }
+ *
+ * Roles: `born` / `hit` / `finish` / `loop` (see the manifest note on the unit entry). `role` is looked up on the
+ * skill's own entry first, then — for roles a cast shares with the unit (`hit`) — nothing else: the CALLER decides the
+ * fallback (`unit()` falls back to `u.hit`, the skill event to `u.finish`), so a unit whose entry has no `skillSfx` at
+ * all behaves exactly as it did before this section existed. Both the numeric and the string form of the index are
+ * accepted (JSON keys are strings; `skillIndex` off a snapshot is a number).
+ * @param {any} manifest data/assets.json
+ * @param {string} defId charId/tokenId/enemyId (sfx.units key)
+ * @param {number|string|null|undefined} skillIndex 0-based equipped skill index
+ * @param {'born'|'hit'|'finish'|'loop'} role
+ * @returns {string|null} sound URL, or null when this unit / skill / role has none
+ */
+export function skillSfxUrl(manifest, defId, skillIndex, role) {
+  if (typeof defId !== 'string' || defId === '') return null;
+  if (!Number.isInteger(skillIndex) && typeof skillIndex !== 'string') return null;
+  const s = manifest?.audio?.sfx?.units?.[defId]?.skillSfx;
+  if (!s || typeof s !== 'object') return null;
+  const e = s[String(skillIndex)];
+  if (!e || typeof e !== 'object') return null;
+  return typeof e[role] === 'string' ? e[role] : null;
+}
+
+/**
  * A content-owned projectile's own sound (`audio.sfx.proj`, docs/ASSETS.md "投射物音效"): the projectile kinds the sim
  * streams in `b.snap.proj` ('note' = 丰川祥子's talent note, 'noteSkill' = her skills') are sound classes of their own —
  * her note's launch is NOT her `attack` cue, and the manifest's `born` is the DEPLOYMENT sound (`ON_UNIT_BORN`,
@@ -360,6 +400,22 @@ export function resultSpeaker(pp, random = Math.random, charOf = null) {
 /** Concurrency + cooldown gate for battle SFX. Pure (time is passed in). */
 /** Gestures that may unlock audio: iOS Safari only accepts touchend / click / keydown; pointerdown covers the rest. */
 const UNLOCK_EVENTS = ['pointerdown', 'touchend', 'click', 'keydown'];
+/**
+ * SFX priority tiers of the `pri` argument every limiter call carries (lower wins). A field of two 丰川祥子 makes three
+ * sounds per attack — 挥击 + 音符诞生 + 音符命中, each of them a note or an impact — and the global `MAX_VOICES` cap is
+ * what they fill: an event sound that arrives while the cap is full used to be refused outright, so the ONE sound a
+ * player most needs (技能发动 / 部署 / 阵亡) was the one that went missing (owner report 「现在三技能开大没有大招音效了」,
+ * measured: see docs/ASSETS.md). The official banks answer this with `maxSoundAllowed` + `popOldest`: a new copy of an
+ * important cue takes the place of an older, unimportant one.
+ */
+export const SFX_PRI = Object.freeze({
+  /** Critical events: a skill's activation, a deployment, a death, an operator's card being played. Never starved. */
+  event: 0,
+  /** The unit's own ordinary attack / impact sounds. */
+  unit: 1,
+  /** High-frequency decoration: a content-owned projectile's launch (音符诞生), a generic battle cue. */
+  deco: 2,
+});
 
 export class SfxLimiter {
   /** @param {{ maxVoices?: number, unitCooldownMs?: number, urlGapMs?: number, maxPerUrl?: number }} [o] */
@@ -379,17 +435,38 @@ export class SfxLimiter {
     this.lastByUrlUnit = new Map();   // `${unitKey}\u0000${url}` → ms of that unit's last copy
     this.lastByUrl = new Map();       // keyless sounds only (unitKey == null): the per-url gap of one stream
     this.activeByUrl = new Map();
+    /** Acquisition token → { url, pri } of every voice that still holds a slot (the `popOldest` candidates). */
+    this.voices = new Map();
+    this.nextToken = 1;
+    /** The token of the acquisition `tryAcquire` just granted (0 = refused); read it right after a `true` answer. */
+    this.lastToken = 0;
   }
 
   /**
-   * Whether a sound may start now; records it when allowed (call `release(url)` when it ends).
+   * Whether a sound may start now; records it when allowed (call `release` / `finish` when it ends). When the voice cap
+   * is full and the new sound's `pri` is strictly better (lower) than an older voice's, that older voice is evicted and
+   * the slot given to the new one (`popOldest`, per the official banks' own field) — an event sound therefore always
+   * plays, while the decorations it displaced simply end early instead of silencing it.
    * @param {number} now ms
    * @param {string|number|null} unitKey e.g. `${unitId}:atk` (null = no per-unit state at all)
    * @param {string} url
+   * @param {number} [pri] the tier (SFX_PRI; omitted = event tier, so a caller that does not care is never starved)
+   * @returns {boolean} whether the sound may start; its acquisition token is `lastToken` (0 when it may not)
    */
-  tryAcquire(now, unitKey, url) {
-    if (this.active >= this.maxVoices) return false;
-    if ((this.activeByUrl.get(url) || 0) >= this.maxPerUrl) return false;
+  tryAcquire(now, unitKey, url, pri = SFX_PRI.event) {
+    this.lastToken = 0;
+    const p = Number.isFinite(pri) ? pri : SFX_PRI.event;
+    if ((this.activeByUrl.get(url) || 0) >= this.maxPerUrl) {
+      // a third overlapping copy of one file: allowed only for a STRICTLY more important sound, and never for another
+      // copy at the same tier (the official maxSoundAllowed 2 is a property of the bank, not of the limiter's mood)
+      const v = this._findVoice((x) => x.url === url && x.pri > p);
+      if (!v) return false;
+      this._kill(v.token, v);
+    } else if (this.active >= this.maxVoices) {
+      const v = this._findVoice((x) => x.pri > p);
+      if (!v) return false;
+      this._kill(v.token, v);
+    }
     if (unitKey != null) {
       const t = this.lastByUnit.get(unitKey);
       if (t != null && now - t < this.unitCooldownMs) return false;
@@ -404,13 +481,44 @@ export class SfxLimiter {
     }
     if (map.size > this.maxKeys) map.clear();
     map.set(urlKey, now);
+    const token = this.nextToken++;
     this.active += 1;
     this.activeByUrl.set(url, (this.activeByUrl.get(url) || 0) + 1);
+    this.voices.set(token, { url, pri: p });
+    this.lastToken = token;
     return true;
   }
 
-  /** A sound started by tryAcquire ended. */
-  release(url) {
+  /** The oldest voice matching `want` ({ token, url, pri }), or null. Insertion order = oldest first. */
+  _findVoice(want) {
+    for (const [token, v] of this.voices) if (want(v)) return { token, ...v };
+    return null;
+  }
+
+  /** Free one voice that the limiter itself displaced (`popOldest`); its owner stops the audio node through `onEvict`. */
+  _kill(token, v) {
+    this.voices.delete(token);
+    this.active = Math.max(0, this.active - 1);
+    const n = this.activeByUrl.get(v.url) || 0;
+    if (n <= 1) this.activeByUrl.delete(v.url); else this.activeByUrl.set(v.url, n - 1);
+    try { this.onEvict?.(token); } catch { /* ignore */ }
+  }
+
+  /**
+   * Whether an acquired token may still start its sound (`_play` checks this after its buffer decoded, so a sound the
+   * limiter displaced while it was loading never starts late on top of the one that took its slot).
+   * @param {number} token
+   */
+  alive(token) { return this.voices.has(token); }
+
+  /** A sound started by tryAcquire ended (or the caller gave up on it). A token the limiter already freed is a no-op. */
+  release(url, token = null) {
+    if (Number.isFinite(token)) {
+      const v = this.voices.get(token);
+      if (!v) return;                        // displaced by _kill (its own release already counted), or never acquired
+      this._kill(token, v);
+      return;
+    }
     this.active = Math.max(0, this.active - 1);
     const n = this.activeByUrl.get(url) || 0;
     if (n <= 1) this.activeByUrl.delete(url); else this.activeByUrl.set(url, n - 1);
@@ -508,6 +616,10 @@ export class AudioManager {
     this.bufBytes = new Map(); // url → decoded PCM bytes (the byte budget of the LRU, see _buffer)
     this.warned = new Set();
     this.limiter = new SfxLimiter();
+    // a voice the limiter displaces (`popOldest`, SFX_PRI): the manager stops its node through the ender the sound itself
+    // registered (`voiceEnd`), so a displaced decoration really goes quiet instead of ringing under the event sound
+    this.voiceEnd = new Map();   // limiter token → that sound's own ender
+    this.limiter.onEvict = (token) => { const end = this.voiceEnd.get(token); if (end) end(); };
     this.voiceGate = new VoiceGate();
     this.voiceNode = null;    // { src, gain, url, token } of the line on air
     this.voiceToken = 0;
@@ -518,6 +630,10 @@ export class AudioManager {
     this.bgmToken = 0;
     this.units = new Map();   // battle unit id → defId
     this.pendingSkill = new Map(); // unit id → a 'skill' tuple that arrived before its unit was known (see _track)
+    this.activeSkill = new Map(); // unit id → the skill index currently casting (the key of sfx.units[id].skillSfx)
+    this.recentSkill = new Map(); // unit id → { index, endedAt } of the cast that just ended (an instant skill's notes land later)
+    this.loops = new Map();        // loop key → { src, gain, token, timer } of a running 持续段循环音 (see startLoop)
+    this.loopToken = 0;
     this.lastAttacker = new Map(); // target id → { def, at } of the hostile attack last aimed at it (its impact sound)
     this.consumed = new Set();     // summons used up by their own effect (香槟炸弹 exploded): no death sound
     this.installed = false;
@@ -807,18 +923,30 @@ export class AudioManager {
 
   // ---- SFX ------------------------------------------------------------------------------------------------
 
-  _play(url, { volume = 1, rate = 1, limited = false, unitKey = null, now = null } = {}) {
+  _play(url, { volume = 1, rate = 1, limited = false, unitKey = null, now = null, pri = SFX_PRI.event } = {}) {
     if (!this.ctx || !url || this.volumes.muted || this.volumes.sfx <= 0) return;
     // `now` lets a caller (or a test) hand in the reading a whole batch shares: one socket message delivers several
     // events at once and they all see the same `performance.now()`, which is exactly the case the limiter's per-unit
     // gap has to answer correctly.
     const t = Number.isFinite(now) ? now : typeof performance !== 'undefined' ? performance.now() : Date.now();
-    if (limited) { if (!this.limiter.tryAcquire(t, unitKey, url)) return; }
-    else if (this.uiVoices >= 12) return;
+    let token = 0;
+    if (limited) {
+      if (!this.limiter.tryAcquire(t, unitKey, url, pri)) return;
+      token = this.limiter.lastToken;
+    } else if (this.uiVoices >= 12) return;
     else this.uiVoices += 1;
-    const release = () => { if (limited) this.limiter.release(url); else this.uiVoices = Math.max(0, this.uiVoices - 1); };
+    const release = () => {
+      if (limited) this.limiter.release(url, token);
+      else this.uiVoices = Math.max(0, this.uiVoices - 1);
+    };
+    // a voice the limiter displaces (`popOldest`) is stopped HERE, through the node the ender below closes over: freeing
+    // the slot without stopping the node would leave the displaced sound ringing on top of the one that took its place.
+    if (limited) this.voiceEnd.set(token, release);
+    const forget = () => { if (limited) this.voiceEnd.delete(token); };
     this._buffer(url).then((buf) => {
-      if (!buf || !this.ctx) { release(); return; }
+      // `alive`: the limiter may have displaced this voice while its buffer was loading (`popOldest`) — that slot now
+      // belongs to the sound that took it, and starting late would put two sounds on one slot (and free the wrong one).
+      if (!buf || !this.ctx || (limited && !this.limiter.alive(token))) { release(); forget(); return; }
       try {
         const s = this.ctx.createBufferSource();
         s.buffer = buf;
@@ -827,12 +955,99 @@ export class AudioManager {
         g.gain.value = Math.max(0, Math.min(1.5, volume));
         s.connect(g); g.connect(this.sfxGain);
         let done = false;
-        const end = () => { if (!done) { done = true; release(); try { g.disconnect(); } catch { /* ignore */ } } };
+        const end = () => {
+          if (done) return;
+          done = true;
+          this.voiceEnd.delete(token);
+          release();
+          try { s.stop(); } catch { /* ignore */ }   // idempotent: an evicted voice stops early, a finished one is over
+          try { g.disconnect(); } catch { /* ignore */ }
+        };
+        // an eviction that happened between the decode and here: the ender already ran and stopped nothing
+        if (limited && !this.limiter.alive(token)) { end(); return; }
+        if (limited) this.voiceEnd.set(token, end);
         s.onended = end;
         setTimeout(end, (buf.duration / rate) * 1000 + 250); // safety if onended never fires
         s.start();
-      } catch { release(); }
-    }, release);
+      } catch { release(); forget(); }
+    }, () => { release(); forget(); });
+  }
+
+  /**
+   * 持续段循环音: start a sound that rings until `stopLoop` (a skill's sustained section, `skillSfx[i].loop`). One loop
+   * per `key` — a second start on the same key replaces the first, so a skill re-cast before its end event cannot stack.
+   *
+   * The sound is NOT an official `loop: true` bank replayed by the game: the official client starts the bank when its
+   * buff starts and stops it when the skill finishes (`soundFXCtrlBanks` `ctrlStop` / `ctrlStopFadetime`), which is
+   * exactly start/stop. Web Audio plays it the same way (`createBufferSource` with `loop = true`), through the SFX
+   * channel, so 音效 volume and 静音 apply like every other sound. It is deliberately not routed through SfxLimiter:
+   * the limiter counts overlapping one-shots, and a loop has no "end" to release it — `SKILL_LOOP_MAX_S` bounds it
+   * instead, and `stopAllLoops` (a new field, a death) ends it early.
+   * @param {string} key identity of the loop (`skill:<unitId>` for a skill's own loop)
+   * @param {string} url sound URL (the manifest's own)
+   * @param {{ volume?: number, maxS?: number, on?: boolean }} [o] `on` = false starts nothing but still clears the key
+   * @returns {boolean} whether a loop is (now) playing under that key
+   */
+  startLoop(key, url, o = {}) {
+    if (typeof key !== 'string' || !key) return false;
+    try {
+      this.stopLoop(key, { fadeS: 0 });   // replacing / clearing: never two loops under one key
+      if (o.on === false || !this.ctx || typeof url !== 'string' || !url) return false;
+      if (this.volumes.muted || this.volumes.sfx <= 0) return false;
+      const token = ++this.loopToken;
+      const rec = { src: null, gain: null, token, timer: null };
+      this.loops.set(key, rec);
+      const maxS = Number.isFinite(o.maxS) ? o.maxS : SKILL_LOOP_MAX_S;
+      rec.timer = setTimeout(() => this.stopLoop(key), maxS * 1000);   // safety: an end event we never see
+      this._buffer(url).then((buf) => {
+        const cur = this.loops.get(key);
+        if (!cur || cur.token !== token) return;   // stopped (or replaced) while it decoded
+        if (!buf || !this.ctx) { this.stopLoop(key); return; }
+        try {
+          const s = this.ctx.createBufferSource();
+          s.buffer = buf;
+          s.loop = true;
+          const g = this.ctx.createGain();
+          g.gain.value = Math.max(0, Math.min(1.5, Number.isFinite(o.volume) ? o.volume : 0.7));
+          s.connect(g); g.connect(this.sfxGain);
+          s.start();
+          cur.src = s; cur.gain = g;
+        } catch { this.stopLoop(key); }
+      }, () => this.stopLoop(key));
+      return true;
+    } catch (err) { this._warn('loop', err); return false; }
+  }
+
+  /**
+   * Stop a loop started by `startLoop` (fades out over the official `ctrlStopFadetime`, 0.2 s by default) and forget its
+   * key. A key with no loop is a no-op, so a caller may stop unconditionally.
+   * @param {string} key
+   * @param {{ fadeS?: number }} [o]
+   */
+  stopLoop(key, o = {}) {
+    const rec = this.loops.get(key);
+    if (!rec) return;
+    this.loops.delete(key);
+    rec.token = -1;                       // a start still decoding must not attach itself to this key
+    if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+    const fadeS = Number.isFinite(o.fadeS) ? o.fadeS : SKILL_LOOP_FADE_S;
+    const { src, gain } = rec;
+    if (!src || !this.ctx) return;
+    const kill = () => { try { src.stop(); } catch { /* ignore */ } try { gain.disconnect(); } catch { /* ignore */ } };
+    try {
+      const t = this.ctx.currentTime;
+      if (fadeS > 0) {
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setValueAtTime(gain.gain.value, t);
+        gain.gain.linearRampToValueAtTime(0, t + fadeS);
+        setTimeout(kill, (fadeS + 0.05) * 1000);
+      } else kill();   // `src.stop()` on a source that never started is legal (it is simply ended)
+    } catch { kill(); }
+  }
+
+  /** Every loop of the current field (a new field, or a battle whose events stopped arriving). */
+  stopAllLoops() {
+    for (const key of [...this.loops.keys()]) this.stopLoop(key, { fadeS: 0 });
   }
 
   /**
@@ -840,18 +1055,24 @@ export class AudioManager {
    * @param {string} name
    * @param {{ volume?: number }} [o]
    */
-  sfx(name, o = {}) {
-    try {
+  sfx(name, o = {}) {    try {
       const url = this.getManifest()?.audio?.sfx?.ui?.[name];
       if (typeof url === 'string') this._play(url, { volume: o.volume ?? 0.9 });
     } catch { /* ignore */ }
   }
 
-  /** Battle sound by name (sfx.battle keys), limited like unit sounds. */
+  /**
+   * Battle sound by name (sfx.battle keys), limited like unit sounds. A generic battle cue is DECORATION (SFX_PRI) —
+   * `o.pri` raises the few that are alerts of their own (漏怪's exit alarm: an event, not a garnish).
+   * @param {string} name
+   * @param {{ volume?: number, unitKey?: string|number, pri?: number }} [o]
+   */
   battle(name, o = {}) {
     try {
       const url = this.getManifest()?.audio?.sfx?.battle?.[name];
-      if (typeof url === 'string') this._play(url, { volume: o.volume ?? 0.7, limited: true, unitKey: o.unitKey ?? `b:${name}` });
+      if (typeof url === 'string') {
+        this._play(url, { volume: o.volume ?? 0.7, limited: true, unitKey: o.unitKey ?? `b:${name}`, pri: o.pri ?? SFX_PRI.deco });
+      }
     } catch { /* ignore */ }
   }
 
@@ -860,22 +1081,33 @@ export class AudioManager {
    * @param {string} defId charId/tokenId/enemyId (or chess id — mapped via its spine/char id by the caller)
    * @param {'attack'|'hit'|'skill'|'die'|'born'} kind
    * @param {number|string} unitId battle unit id (cooldown key)
-   * @param {number} [skillIndex] the equipped skill (its own `skills[index]` cue)
+   * @param {number} [skillIndex] the skill the sound belongs to: its own `skillSfx[index].<kind>` (the 按技能细分 roles —
+   *   her S1 / S2 / S3 impacts are three different files), else the unit's own role; for `kind === 'skill'` the equipped
+   *   skill's ACTIVATION cue (`skills[index]`, DESIGN §16). A role the skill does not carry falls back to the unit's,
+   *   so a unit with no `skillSfx` at all sounds exactly as before
    * @param {number} [now] the batch's own clock reading (all events of one socket message share it; see _play)
    * @returns {boolean} whether a unit-specific sound exists
    */
   unit(defId, kind, unitId, skillIndex, now = null) {
     try {
       const u = this.getManifest()?.audio?.sfx?.units?.[defId];
-      // DESIGN §16: the equipped skill's own ON_SKILL_START sound (`skills[index]`) when the manifest has it
-      const own = kind === 'skill' && Number.isInteger(skillIndex) && u?.skills ? u.skills[skillIndex] : null;
+      // 按技能细分 (docs/ASSETS.md): only for the ROLES the unit's own entry carries once. `skill` is NOT one of them: a
+      // cast cue is `skills[index]` (DESIGN §16) and the skill's `born` role is the note's LAUNCH, which the renderer
+      // asks for by projectile kind (`playProj` → `sfx.proj`) — reading `skillSfx[i].born` here would replace her
+      // 大招音 with the note's launch sound, which is exactly what this branch must not do.
+      const own = kind === 'skill'
+        ? (Number.isInteger(skillIndex) && u?.skills ? u.skills[skillIndex] : null)
+        : skillSfxUrl(this.getManifest(), defId, skillIndex, kind);
       const url = typeof own === 'string' ? own : u?.[kind];
       if (typeof url !== 'string') return false;
       if ((kind === 'attack' || kind === 'hit') && !normalAttackSfx(defId, url)) return false;
-      // the official bank's mix (header): a silent roll still counts as the unit's own sound (no generic fallback)
-      const mix = kind === 'skill' ? null : u?.mix?.[kind];
+      // the official bank's mix (header): a silent roll still counts as the unit's own sound (no generic fallback).
+      // A per-skill cue has no `mix` of its own (the plan writes mix per unit role only): it plays at the base gain.
+      const mix = typeof own === 'string' || kind === 'skill' ? null : u?.mix?.[kind];
       if (!unitSoundPlays(mix, this.random())) return true;
-      this._play(url, { volume: unitGain(kind === 'attack' || kind === 'hit' ? 0.55 : 0.8, mix), limited: true, unitKey: `${unitId}:${kind}`, now });
+      // an EVENT sound (技能发动 / 部署 / 阵亡 / 出生): the tiers keep it from being starved by the note storm (SFX_PRI)
+      const pri = kind === 'attack' || kind === 'hit' ? SFX_PRI.unit : SFX_PRI.event;
+      this._play(url, { volume: unitGain(kind === 'attack' || kind === 'hit' ? 0.55 : 0.8, mix), limited: true, unitKey: `${unitId}:${kind}`, now, pri });
       return true;
     } catch { return false; }
   }
@@ -895,7 +1127,8 @@ export class AudioManager {
       const url = projSfxUrl(this.getManifest(), kind, o.role ?? 'born', o.unit ?? null);
       if (typeof url !== 'string') return false;
       const key = o.unitId ?? o.unit ?? kind;
-      this._play(url, { volume: o.volume ?? 0.7, limited: true, unitKey: `proj:${kind}:${key}`, now: o.now ?? null });
+      // a note's launch is high-frequency DECORATION: it must never take the slot an event sound needs (SFX_PRI)
+      this._play(url, { volume: o.volume ?? 0.7, limited: true, unitKey: `proj:${kind}:${key}`, now: o.now ?? null, pri: SFX_PRI.deco });
       return true;
     } catch { return false; }
   }
@@ -994,6 +1227,10 @@ export class AudioManager {
     this.units.clear();
     this.lastAttacker.clear();
     this.consumed.clear();
+    this.activeSkill.clear();
+    this.recentSkill.clear();
+    // a new field is a new battle: a sustained loop of the previous one must not ring on (and neither must a skill's)
+    try { this.stopAllLoops(); } catch { /* ignore */ }
     // a new field is a new battle: the first operator deployed says 行动出发 again and no cooldown carries over
     this.startVoiceDone = false;
     try { this.voiceGate.reset(); this._stopVoice(); } catch { /* ignore */ }
@@ -1011,6 +1248,9 @@ export class AudioManager {
     // official class sounds (operator vs summon vs device)
     this.units.set(u.id, { def: u.spine || u.defId, defId: u.defId ?? null, kind: u.kind ?? null, side: u.side, boss: !!u.boss,
       skillIndex: Number.isInteger(u.skillIndex) ? u.skillIndex : null });
+    // NB: `skillIndex` is the EQUIPPED skill, not a running one, so nothing is started here — the 持续段循环音 of a
+    // sustained skill begins on its own `['skill', id, 1]` (below), which is also the event that arrives for a unit
+    // already tracked. Seeding a loop from the equipped index would ring the sustained sound of a skill nobody cast.
     // a cast that arrived before this unit was known (handleBattleEvents): play it now, once. No unit is ever tracked
     // twice into a stale entry — `setFieldUnits` clears both maps — so this cannot double a cue.
     const held = this.pendingSkill.get(u.id);
@@ -1020,9 +1260,29 @@ export class AudioManager {
     }
   }
 
-  /** Play a resolved battle sound for a unit event, limited like unit sounds. */
+  /**
+   * Start / stop the 持续段循环音 of one unit's sustained skill (`sfx.units[def].skillSfx[index].loop`), keyed by the
+   * unit so two of that operator never share one loop. Called on the skill's own `['skill', id, 1]` / `['skill', id, 0]`
+   * (the end event is also its official stop: 丰川祥子's S3 has no finish FILE, `soundFXCtrlBanks` stops its loop
+   * instead) and on a unit that dies or leaves mid-skill.
+   * @param {number|string} unitId battle unit id
+   * @param {string} def unit model id (sfx.units key)
+   * @param {number|null} skillIndex
+   * @param {boolean} on
+   */
+  _skillLoop(unitId, def, skillIndex, on) {
+    const url = skillSfxUrl(this.getManifest(), def, skillIndex, 'loop');
+    this.startLoop(`skill:${unitId}`, url, { on: on && typeof url === 'string', volume: 0.7 });
+  }
+
+  /**
+   * Play a resolved battle sound for a unit event, limited like unit sounds. A death / deployment cue is an EVENT
+   * (SFX_PRI): the generic b_char_dead / b_char_set fallbacks it plays for everyone must not be starved by decorations.
+   */
   _playUnitUrl(url, unitKey, volume = 0.8) {
-    if (typeof url === 'string') this._play(url, { volume, limited: true, unitKey });
+    if (typeof url === 'string') {
+      this._play(url, { volume, limited: true, unitKey, pri: /:(die|born)$/.test(String(unitKey)) ? SFX_PRI.event : SFX_PRI.deco });
+    }
   }
 
   /**
@@ -1042,20 +1302,47 @@ export class AudioManager {
           if (CHAIN_KINDS.has(e[3])) { this.lastAttacker.delete(e[2]); continue; }
           const src = this.units.get(e[1]);
           if (!src) continue;
-          // only a hostile attack authors the target's next impact (a heal — an ally aiming at an ally — never does)
+          // only a hostile attack authors the target's next impact (a heal — an ally aiming at an ally — never does).
+          // The skill it was made under travels with it: the impact that follows plays THAT skill's own `hit`
+          // (`skillSfx[i].hit`, e.g. her S1 / S2 / S3 note impacts are three different files), falling back to the
+          // unit's ordinary `hit` when the manifest carries none — see the `dmg` branch.
           const tgt = this.units.get(e[2]);
-          if (tgt && tgt.side !== src.side) this.lastAttacker.set(e[2], { def: src.def, at: now });
+          if (tgt && tgt.side !== src.side) {
+            // The skill the attack was made under travels with it: the impact that follows plays THAT skill's own `hit`
+            // (her S1 / S2 / S3 note impacts are three different files), falling back to the unit's ordinary `hit` when
+            // the manifest carries none — see the `dmg` branch. An INSTANT skill (her S1) has already ended when the
+            // note it fired lands (`skills.js` emits `['skill', id, 1]` and, in the same tick, `['skill', id, 0]` —
+            // measured in a browser), so a cast that ended within the impact window still counts for it. A running cast
+            // needs no such window: it covers exactly the attacks made while it runs. (The unit's own `skillIndex` is
+            // the skill it is EQUIPPED with, and is deliberately NOT used here: equipped is not evidence that damage
+            // dealt on a plain attack is that skill's.)
+            const running = this.activeSkill.get(e[1]);
+            const ended = this.recentSkill.get(e[1]);
+            const skill = running ?? (ended && now - ended.endedAt <= IMPACT_WINDOW_MS ? ended.index : null);
+            this.lastAttacker.set(e[2], { def: src.def, at: now, skill: skill ?? null });
+          }
           if (!this.unit(src.def, 'attack', e[1]) && src.side === 'enemy') this.battle('enemyHit', { unitKey: `${e[1]}:atk`, volume: 0.35 });
         } else if (kind === 'dmg') {
           const by = this.lastAttacker.get(e[1]);
           if (!by || !IMPACT_TYPES.has(e[3])) continue;
           this.lastAttacker.delete(e[1]); // one impact per attack
-          if (now - by.at <= IMPACT_WINDOW_MS) this.unit(by.def, 'hit', `h${e[1]}`);
+          if (now - by.at <= IMPACT_WINDOW_MS) this.unit(by.def, 'hit', `h${e[1]}`, by.skill ?? undefined, now);
         } else if (kind === 'heal') {
           this.battle('heal', { unitKey: `heal:${e[1]}`, volume: 0.35 });
         } else if (kind === 'skill' && e[2]) {
           const u = this.units.get(e[1]);
           if (u) {
+            // a cast: this unit's skill becomes the scope every impact of this cast resolves against (`skillSfx[i].hit`)
+            // AND, when the skill carries one, the sustained loop starts.
+            //
+            // The scope hangs on the unit having a `skillSfx` entry, NOT on the skill having a `loop`: S2 is a sustained
+            // skill with a `hit` and a `finish` but no loop bank of its own (`ON_BUFF_START…[loop]` is S3's), so gating
+            // the scope on `loop` left every S2 impact on the unit's ordinary `hit` — measured in a browser before this
+            // was fixed (22 skill-note impacts, all `p_imp_mjckyrdnt`).
+            const m = this.getManifest();
+            const perSkill = u.skillIndex != null && m?.audio?.sfx?.units?.[u.def]?.skillSfx?.[String(u.skillIndex)];
+            if (perSkill) this.activeSkill.set(e[1], u.skillIndex);
+            this._skillLoop(e[1], u.def, u.skillIndex, true);
             this.unit(u.def, 'skill', e[1], u.skillIndex ?? undefined);
             // 作战中N: the equipped skill's own slot (0-based; 作战中4 is the fallback of a 4th slot)
             if (unitSoundClass(u) === 'char') {
@@ -1071,6 +1358,20 @@ export class AudioManager {
             // which is also how the same order inside a replayed pre-entry buffer is covered (screens/game.js hands the
             // whole buffered list over instead of its 'spawn' tuples alone).
             this.pendingSkill.set(e[1], e);
+          }
+        } else if (kind === 'skill') {
+          // 技能结束 (`['skill', id, 0]`): the cast is over — its own end cue (`skillSfx[i].finish`), and the sustained
+          // loop it started stops with the official fade (`soundFXCtrlBanks ctrlStop`: S3's end cue IS that stop, it has
+          // no finish file). A unit whose entry carries neither is silent here, exactly as before this section existed.
+          const u = this.units.get(e[1]);
+          if (u) {
+            const i = this.activeSkill.get(e[1]) ?? (Number.isInteger(u.skillIndex) ? u.skillIndex : null);
+            this.activeSkill.delete(e[1]);
+            // an instant skill ends in the tick that started it while the notes it fired are still flying: remember the
+            // cast for the impact window, so their landing can still be attributed to it (`dmg` above)
+            if (i != null) this.recentSkill.set(e[1], { index: i, endedAt: now });
+            this._skillLoop(e[1], u.def, i, false);
+            this.unit(u.def, 'finish', e[1], i ?? undefined, now);
           }
         } else if (kind === 'engage') {
           // 行动开始: the first attack a unit makes on an enemy (the sim's ENGAGE, official ENCOUNTER_ENEMY, 3 s apart)
@@ -1096,7 +1397,8 @@ export class AudioManager {
           if (now - (this.lastLeakSfxAt ?? -Infinity) < LEAK_SFX_GAP_MS) continue;
           if (typeof this.getManifest()?.audio?.sfx?.battle?.leak !== 'string') continue;
           this.lastLeakSfxAt = now;
-          this.battle('leak', { unitKey: 'leak', volume: 0.85 });
+          // an alarm of its own (the official bank is maxSoundAllowed 1 / popOldest): an EVENT, never starved
+          this.battle('leak', { unitKey: 'leak', volume: 0.85, pri: SFX_PRI.event });
         } else if (kind === 'deploy') {
           const u = this.units.get(e[1]);
           if (!u || u.side === 'enemy') continue;

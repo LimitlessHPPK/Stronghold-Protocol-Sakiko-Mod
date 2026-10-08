@@ -49,11 +49,11 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SKILL_START_BANKS, UNIT_SFX_BANKS, PROJECTILE_SFX_BANKS, indexAudio, pickUnitSfx, projSfx, unitSfxBanks } from '../tools/assets/audio.mjs';
+import { SKILL_START_BANKS, SKILL_SFX_BANKS, SKILL_SFX_ROLES, UNIT_SFX_BANKS, PROJECTILE_SFX_BANKS, indexAudio, pickUnitSfx, projSfx, skillSfx, unitSfxBanks } from '../tools/assets/audio.mjs';
 import { SOUND_ALTS, soundAlt, soundAltOfUrl, soundPathOfUrl, projSfxLeaves } from '../tools/assets/plan.mjs';
 import { isMp3 } from '../tools/assets/formats.mjs';
 import { parseArgs, planSkills, sfxJobs } from '../tools/fetch-voice-override.mjs';
-import { AudioManager, normalAttackSfx, projSfxUrl } from '../public/js/audio.js';
+import { AudioManager, normalAttackSfx, projSfxUrl, skillSfxUrl } from '../public/js/audio.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = join(ROOT, 'public');
@@ -70,6 +70,32 @@ const V014 = {
   attack: '/assets/audio/sfx/player/p_atk/p_atk_mjckyrdslnt.mp3',
   hit: '/assets/audio/sfx/player/p_imp/p_imp_mjckyrdnt.mp3',
 };
+/**
+ * 按技能细分 (`sfx.units[id].skillSfx`, SKILL_SFX_BANKS): what each of her three skills owns, as the file the official
+ * bank carries. S1 has no `ON_PROJECTILE_*` bank at all (its impact sits on `ON_CUSTOM_TRIGGER.…_s1_hit`) and S3 has no
+ * finish FILE — its `soundFXCtrlBanks` entry stops the loop instead — so the roles differ per skill on purpose.
+ */
+const SKILL_SFX_EXPECTED = {
+  skchr_oblvns_1: { index: 0, roles: { hit: 'player/p_imp/p_imp_mjckyrdglsnt.mp3' } },
+  skchr_oblvns_2: {
+    index: 1,
+    roles: {
+      born: 'player/p_atk/p_atk_mjckyrdnt_r.mp3',
+      hit: 'player/p_imp/p_imp_mjckyrdnt_r.mp3',
+      finish: 'player/p_skill/p_skill_mjckyrdslnt_h2.mp3',
+    },
+  },
+  skchr_oblvns_3: {
+    index: 2,
+    roles: {
+      born: 'player/p_atk/p_atk_mjckyrdnt_r.mp3',
+      hit: 'player/p_imp/p_imp_mjckyrdslnt.mp3',
+      loop: 'player/p_atk/p_atk_mjckyrdslnt_lp.mp3',
+    },
+  },
+};
+/** S3's own end is `soundFXCtrlBanks` (a STOP of the loop), not a sound: no `finish` may ever be planned for it. */
+const S3_FINISH_CTRL = { targetBank: 'battle.ON_BUFF_START.oblvns_s_3[loop]', ctrlStop: true, ctrlStopFadetime: 0.2 };
 
 const readJson = (rel) => JSON.parse(readFileSync(join(ROOT, rel), 'utf8'));
 const a07 = readJson('docs/research/07-assets.json');
@@ -225,6 +251,136 @@ describe('PROJECTILE_SFX_BANKS (audio.mjs): 音符诞生, the launch sound of a 
   });
 });
 
+describe('SKILL_SFX_BANKS (audio.mjs): 按技能细分, the sounds one SKILL owns', () => {
+  test('her three skills, each role resolved from the official banks the table names', { skip: noAudio }, () => {
+    assert.deepEqual(Object.keys(SKILL_SFX_BANKS).sort(), Object.keys(SKILL_SFX_EXPECTED).sort());
+    assert.deepEqual(SKILL_SFX_ROLES, ['born', 'hit', 'finish', 'loop'], 'the roles the manifest may carry');
+    const mine = allSkills.filter((x) => x.s.skillId in SKILL_SFX_EXPECTED);
+    assert.deepEqual(mine.map((x) => [x.id, x.s.index, x.s.skillId]).sort(),
+      Object.keys(SKILL_SFX_EXPECTED).map((sid) => [CHAR, SKILL_SFX_EXPECTED[sid].index, sid]).sort(), 'the table names HER skills');
+    for (const [skillId, want] of Object.entries(SKILL_SFX_EXPECTED)) {
+      const roles = SKILL_SFX_BANKS[skillId];
+      for (const role of Object.keys(roles)) assert.ok(SKILL_SFX_ROLES.includes(role), `${skillId}: ${role} is a known role`);
+      for (const [role, names] of Object.entries(roles)) {
+        for (const name of names) assert.ok(audio.bank(name).length, `${skillId}.${role}: ${name} carries sounds`);
+      }
+      assert.deepEqual(skillSfx(audio, skillId), want.roles, `${skillId}: role → the file the manifest will play`);
+    }
+    // the four files the section adds are four DIFFERENT sounds: the ordinary `hit` is the talent note's
+    // (`p_imp_MJCkyrdnt`), so an S1 / S2 / S3 impact is audibly its own. This is the whole point of the section.
+    const hits = Object.values(SKILL_SFX_EXPECTED).map((x) => x.roles.hit);
+    assert.equal(new Set(hits).size, 3, 'three distinct skill impacts');
+    assert.ok(!hits.includes(V014.hit.replace('/assets/audio/sfx/', '')), 'none of them is the unit’s ordinary hit');
+    assert.equal(skillSfx(audio, 'skchr_nobody_9'), null, 'a skill the table does not name resolves to nothing');
+    assert.equal(skillSfx(null, 'skchr_oblvns_2'), null, 'no audio index ⇒ no resolution (never a crash)');
+  });
+
+  test('S3 ends by STOPPING its loop (soundFXCtrlBanks), and the bank it stops is `loop: true`', { skip: noAudio }, () => {
+    // The official data is unambiguous here and the schema follows it: S3 has NO `ON_SKILL_FINISH` bank in
+    // soundFXBanks — its finish is a control action on the sustained bank. Planning a `finish` for S3 would invent a
+    // file that does not exist upstream; not consuming the loop would lose the 25 s sustained sound entirely.
+    assert.deepEqual(skillSfx(audio, 'skchr_oblvns_3'), SKILL_SFX_EXPECTED.skchr_oblvns_3.roles);
+    assert.equal(skillSfx(audio, 'skchr_oblvns_3').finish, undefined, 'no finish FILE for S3 (see the ctrl bank)');
+    assert.equal(audioData.soundFXBanks.some((b) => /^battle\.ON_SKILL_FINISH\.skchr_oblvns_3\b/.test(String(b.name))), false,
+      'the official soundFXBanks really carries none');
+    const ctrl = audioData.soundFXCtrlBanks.find((b) => b.name === 'battle.ON_SKILL_FINISH.skchr_oblvns_3');
+    assert.deepEqual(ctrl, { ...S3_FINISH_CTRL, name: 'battle.ON_SKILL_FINISH.skchr_oblvns_3' }, 'the stop, with its 0.2 s fade');
+    const loopBank = audioData.soundFXBanks.find((b) => b.name === S3_FINISH_CTRL.targetBank);
+    assert.equal(loopBank.loop, true, 'the bank the ctrl stops is a loop');
+    assert.equal(loopBank.maxSoundAllowed, 1, 'one loop at a time (the official cap the client’s per-unit key keeps)');
+    // and the file the table resolves the loop to IS that bank's only sound
+    assert.deepEqual(audio.bank(S3_FINISH_CTRL.targetBank), [SKILL_SFX_EXPECTED.skchr_oblvns_3.roles.loop]);
+    // S2, by contrast, HAS a finish bank: the same two takes its cast uses, one per ability index (`.1` → _h2, `.2` → _h1)
+    for (const i of ['1', '2']) {
+      assert.ok(audioData.soundFXBanks.some((b) => b.name === `battle.ON_SKILL_FINISH.skchr_oblvns_2.${i}`), `S2 finish .${i}`);
+    }
+    assert.equal(audio.bank('battle.ON_SKILL_FINISH.skchr_oblvns_2.1')[0], SKILL_SFX_EXPECTED.skchr_oblvns_2.roles.finish, 'index order first');
+  });
+
+  test('the table cannot touch another operator or another skill', { skip: noAudio }, () => {
+    // Generic by construction: nothing outside SKILL_SFX_BANKS resolves, and the planner writes `skillSfx` per operator
+    // from that table alone. 104 pool skills carry only `ON_ABILITY_START.<skillId>` (a known gap, deliberately open),
+    // and none of them may gain a per-skill sound from this change.
+    assert.ok(skills.size > 100, `${skills.size} operators in the plan`);
+    const named = allSkills.filter((x) => skillSfx(audio, x.s.skillId));
+    assert.deepEqual([...new Set(named.map((x) => x.id))], [CHAR], 'only her skills resolve');
+    assert.deepEqual([...new Set(named.map((x) => x.s.skillId))].sort(), Object.keys(SKILL_SFX_BANKS).sort());
+    for (const { s } of allSkills) if (!(s.skillId in SKILL_SFX_BANKS)) assert.equal(skillSfx(audio, s.skillId), null, s.skillId);
+  });
+
+  test('skillSfx resolves one file per role, in bank order, and skips a role whose banks are absent', () => {
+    const mk = (name, asset) => ({ name, sounds: [{ asset }] });
+    const idx = indexAudio({ soundFXBanks: [
+      mk(SKILL_SFX_BANKS.skchr_oblvns_2.hit[1], 'Audio/Sound_Beta_2/P/second'),   // listed second: never wins
+      mk(SKILL_SFX_BANKS.skchr_oblvns_2.hit[0], 'Audio/Sound_Beta_2/P/first'),
+      mk(SKILL_SFX_BANKS.skchr_oblvns_2.born[0], 'Audio/Sound_Beta_2/P/launch'),
+      // no finish bank at all: the role is simply absent, not an error
+    ] });
+    assert.deepEqual(skillSfx(idx, 'skchr_oblvns_2'), { born: 'p/launch.mp3', hit: 'p/first.mp3' },
+      'first bank that resolves wins, an unresolved role is left out');
+    assert.deepEqual(skillSfx(idx, 'skchr_oblvns_3'), null, 'a skill whose banks the index lacks is silent');
+    // a bank with several sounds resolves to its first (the manifest plays one sound per role, never a draw)
+    const multi = indexAudio({ soundFXBanks: [mk(SKILL_SFX_BANKS.skchr_oblvns_3.loop[0], 'Audio/Sound_Beta_2/P/lp_a'),
+      { name: SKILL_SFX_BANKS.skchr_oblvns_3.loop[0], sounds: [{ asset: 'Audio/Sound_Beta_2/P/lp_b' }] }] });
+    assert.deepEqual(skillSfx(multi, 'skchr_oblvns_3'), { loop: 'p/lp_a.mp3' });
+  });
+
+  test('skillSfxUrl (the client): the index, both key spellings, an unknown index/role/unit', () => {
+    const vm = { audio: { sfx: { units: {
+      char_a: { skillSfx: { 0: { hit: '/assets/audio/sfx/p/a0.mp3' }, 2: { finish: '/assets/audio/sfx/p/a2.mp3' } } },
+      char_b: { hit: '/assets/audio/sfx/p/b.mp3' },
+    } } } };
+    assert.equal(skillSfxUrl(vm, 'char_a', 0, 'hit'), '/assets/audio/sfx/p/a0.mp3');
+    assert.equal(skillSfxUrl(vm, 'char_a', '0', 'hit'), '/assets/audio/sfx/p/a0.mp3', 'a snapshot index may arrive as a string');
+    assert.equal(skillSfxUrl(vm, 'char_a', 2, 'finish'), '/assets/audio/sfx/p/a2.mp3');
+    assert.equal(skillSfxUrl(vm, 'char_a', 0, 'finish'), null, 'a role this skill does not carry');
+    assert.equal(skillSfxUrl(vm, 'char_a', 1, 'hit'), null, 'a skill this unit carries no entry for');
+    assert.equal(skillSfxUrl(vm, 'char_b', 0, 'hit'), null, 'a unit with no skillSfx at all (⇒ the caller falls back)');
+    assert.equal(skillSfxUrl(vm, 'char_c', 0, 'hit'), null);
+    assert.equal(skillSfxUrl(vm, null, 0, 'hit'), null);
+    assert.equal(skillSfxUrl(vm, 'char_a', null, 'hit'), null);
+    assert.equal(skillSfxUrl(vm, 'char_a', 1.5, 'hit'), null, 'a non-index resolves nothing');
+    assert.equal(skillSfxUrl(null, 'char_a', 0, 'hit'), null);
+    assert.equal(skillSfxUrl({ audio: { sfx: {} } }, 'char_a', 0, 'hit'), null, 'a manifest without the section is silent');
+  });
+});
+
+/** The manifest-side half of SKILL_SFX_BANKS: what the committed `data/assets.json` carries and what is on disk. */
+describe('skillSfx in the manifest and on disk', () => {
+  const noManifest = !manifest && 'data/assets.json not generated (run npm run assets)';
+  const noAssets = noManifest || !existsSync(PUBLIC) ? 'public/assets missing (run npm run assets)' : false;
+  const her = () => manifest.audio.sfx.units[CHAR];
+
+  test('the manifest carries it: skillSfx per skill index, /assets/audio/sfx/*.mp3', { skip: noManifest }, () => {
+    const s = her().skillSfx;
+    assert.deepEqual(Object.keys(s), ['0', '1', '2'], 'one entry per equipped skill index');
+    for (const want of Object.values(SKILL_SFX_EXPECTED)) {
+      const key = String(want.index);
+      assert.deepEqual(Object.keys(s[key]).sort(), Object.keys(want.roles).sort(), `S${want.index + 1} roles`);
+      for (const [role, path] of Object.entries(want.roles)) {
+        assert.equal(s[key][role], `/assets/audio/sfx/${path}`, `S${want.index + 1}.${role}`);
+        assert.equal(s[key][role], s[key][role].toLowerCase(), 'no upper-case spelling (a Linux server is case-sensitive)');
+      }
+    }
+    // the per-skill roles are ADDITIONAL to the unit roles: nothing the port restored may have moved
+    assert.equal(her().attack, V014.attack);
+    assert.equal(her().hit, V014.hit);
+    assert.deepEqual(Object.keys(her().skills), ['0', '1', '2'], 'the activation cues are untouched');
+    assert.equal(manifest.stats.sfxUnits, Object.keys(manifest.audio.sfx.units).length);
+  });
+
+  test('every one of those files is an mp3 on disk in exactly the case the manifest spells', { skip: noAssets }, () => {
+    for (const [i, roles] of Object.entries(her().skillSfx)) {
+      for (const [role, url] of Object.entries(roles)) {
+        const file = join(PUBLIC, url.replace(/^\/assets\//, 'assets/'));
+        assert.ok(existsSync(file), `S${Number(i) + 1}.${role}: ${url} is on disk (node tools/fetch-voice-override.mjs --sfx)`);
+        assert.ok(readdirSync(dirname(file)).includes(basename(file)), `S${Number(i) + 1}.${role}: exact name on disk`);
+        assert.ok(isMp3(readFileSync(file)), `S${Number(i) + 1}.${role}: ${url} is an MP3`);
+      }
+    }
+  });
+});
+
 describe('UNIT_SFX_BANKS (audio.mjs): the two unit sounds the port lost, pinned to 0.1.4', () => {
   const assetUrl = (p) => `/assets/audio/sfx/${p}`;
 
@@ -304,19 +460,22 @@ describe('fetch-voice-override.mjs --sfx: the jobs are the plan\'s own files', (
   test('one job per alternative of every SKILL_START_BANKS skill; the proxy comes first, then the raw URL', { skip: noAudio }, () => {
     const { jobs, problems } = sfxJobs(skills, null, { audio });
     assert.deepEqual(problems, []);
-    // the plan's cap decides how many alternatives of one bank travel (plan.mjs soundLeaf(SOUND_ALTS))
+    // 按技能细分 (SKILL_SFX_BANKS): a skill the table names by its OWN roles is fetched by those roles instead of the
+    // activation takes — S1 `p_imp_MJCkyrdglsnt`, S2 `…_r` launch + `…_r` impact + the `_h2` finish (its cast cue too,
+    // the same file), S3 `…_r` launch + `p_imp_MJCkyrdslnt` impact + the sustained `…_slnt_lp` loop. The activation takes
+    // S2/S3 would otherwise carry (`_h1`, `_s2`) are the OTHER take of a cue whose role list is already complete.
     assert.deepEqual(jobs.map((j) => [j.skillId, j.skill, j.rel]), [
-      ['skchr_oblvns_1', 'S1', soundAlt(EXPECTED.skchr_oblvns_1.files[0]).rel],
-      ['skchr_oblvns_1', 'S1', soundAlt('player/p_skill/p_skill_mjckyrdglsnt_d2.mp3').rel],
-      ['skchr_oblvns_1', 'S1', soundAlt('player/p_skill/p_skill_mjckyrdglsnt_d3.mp3').rel],
+      ['skchr_oblvns_1', 'S1', soundAlt('player/p_imp/p_imp_mjckyrdglsnt.mp3').rel],
+      ['skchr_oblvns_2', 'S2', soundAlt('player/p_atk/p_atk_mjckyrdnt_r.mp3').rel],
+      ['skchr_oblvns_2', 'S2', soundAlt('player/p_imp/p_imp_mjckyrdnt_r.mp3').rel],
       ['skchr_oblvns_2', 'S2', soundAlt('player/p_skill/p_skill_mjckyrdslnt_h2.mp3').rel],
-      ['skchr_oblvns_2', 'S2', soundAlt('player/p_skill/p_skill_mjckyrdslnt_h1.mp3').rel],
-      ['skchr_oblvns_3', 'S3', soundAlt('player/p_skill/p_skill_mjckyrdslnt_s1.mp3').rel],
-      ['skchr_oblvns_3', 'S3', soundAlt('player/p_skill/p_skill_mjckyrdslnt_s2.mp3').rel],
+      ['skchr_oblvns_3', 'S3', soundAlt('player/p_atk/p_atk_mjckyrdnt_r.mp3').rel],
+      ['skchr_oblvns_3', 'S3', soundAlt('player/p_imp/p_imp_mjckyrdslnt.mp3').rel],
+      ['skchr_oblvns_3', 'S3', soundAlt('player/p_atk/p_atk_mjckyrdslnt_lp.mp3').rel],
     ]);
     for (const j of jobs) {
       assert.equal(j.charId, CHAR, 'only her: the table names her three skills');
-      assert.match(j.rel, /^audio\/sfx\/player\/p_skill\/p_skill_[a-z0-9_]+\.mp3$/, 'the path plan.mjs soundAlt computes');
+      assert.match(j.rel, /^audio\/sfx\/player\/(p_skill|p_atk|p_imp)\/p_[a-z0-9_]+\.mp3$/, 'the path plan.mjs soundAlt computes');
       assert.deepEqual(j.urls, [`https://gh-proxy.com/${rawOf(j.rel)}`, rawOf(j.rel)], 'the mirror policy: proxy, then raw');
     }
     assert.ok(jobs.length <= 3 * SOUND_ALTS, `${SOUND_ALTS} alternatives per skill at most`);
@@ -376,8 +535,17 @@ describe('fetch-voice-override.mjs --sfx: the jobs are the plan\'s own files', (
     assert.equal(her0.attack, V014.attack, '前提：她的 attack 是挥舞声，不是音符的发射音');
     assert.notEqual(proj.note.born, her0.attack, '两种声音各有一个文件：atk 事件与音符诞生都会响');
     const mine = sfxJobs(skills, null, { audio, manifest, proj, charId: CHAR });
-    assert.deepEqual(mine.jobs.filter((j) => j.kind), [], 'a --char run stays the operator\'s own skill sounds');
-    assert.deepEqual(mine.jobs.map((j) => j.skill), ['S1', 'S1', 'S1', 'S2', 'S2', 'S3', 'S3'], 'her seven skill files');
+    // 按技能细分: her entry now references the skill notes' own takes (`skillSfx`), so the kinds whose file her entry
+    // carries travel with her --char run (the noteSkill launch `…_r` IS S2/S3's `born`). The talent note's launch
+    // (`proj.note.born`, `p_atk_MJCkyrdnt`) is still nobody's unit sound and still comes with the default run — the
+    // narrowing only ever DROPS a kind no URL of that operator carries, so this cannot under-fetch her own sounds.
+    assert.deepEqual(mine.jobs.filter((j) => j.kind).map((j) => [j.kind, j.skill]),
+      [['noteSkill', 'noteSkill.born']], 'her own skill notes\' launch travels with her (it is S2/S3 `skillSfx.born`)');
+    assert.deepEqual(mine.jobs.filter((j) => !j.kind).map((j) => `${j.skill}:${j.rel.split('/').pop()}`),
+      ['S1:p_imp_mjckyrdglsnt.mp3', 'S2:p_atk_mjckyrdnt_r.mp3', 'S2:p_imp_mjckyrdnt_r.mp3',
+        'S2:p_skill_mjckyrdslnt_h2.mp3', 'S3:p_atk_mjckyrdnt_r.mp3', 'S3:p_imp_mjckyrdslnt.mp3',
+        'S3:p_atk_mjckyrdslnt_lp.mp3'],
+      'her seven skill files, the roles SKILL_SFX_BANKS names (no duplicate job: one rel is one download)');
     // A run without --char takes every kind; another operator's --char run stays exactly the jobs it had before; and a
     // --char run with no unit entry to read (an older manifest, an operator the plan does not know) keeps every kind:
     // the narrowing only ever happens when there IS an entry, so a --char run over-fetches at worst.
@@ -414,8 +582,8 @@ describe('the manifest, the files on disk and the client', () => {
     const u = her();
     assert.equal(u.attack, V014.attack);
     assert.equal(u.hit, V014.hit);
-    assert.deepEqual(Object.keys(u).sort(), ['attack', 'born', 'die', 'hit', 'skill', 'skills'],
-      'the four unit roles + the skill cues, and nothing else (no invented slot: see UNIT_SFX_BANKS)');
+    assert.deepEqual(Object.keys(u).sort(), ['attack', 'born', 'die', 'hit', 'skill', 'skillSfx', 'skills'],
+      'the four unit roles + the skill cues + the per-skill roles, and nothing else (no invented slot: see UNIT_SFX_BANKS)');
     // the manifest's own numbers: her fix added two FILES, not a unit, and no other unit lost its entry
     assert.equal(manifest.stats.sfxUnits, Object.keys(manifest.audio.sfx.units).length);
     assert.ok(manifest.stats.files >= 8001, `${manifest.stats.files} files listed`);

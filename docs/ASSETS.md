@@ -142,6 +142,69 @@ the generic attack pass reaches it only because `normalModeBank` does not read `
 `p_atk_MJCkyrdnt_h`, which `public/js/audio.js normalAttackSfx()` refuses for a normal attack (`_h` = a skill mode's
 file, user playtest #4 item 6). Pinning the file the client actually plays is what restores 0.1.4's sound.
 
+#### Investigation: 「以清单为准、不再靠文件名启发式」 (NOT changed — for the owner to decide)
+
+`normalAttackSfx(defId, url)` refuses an operator's (`char_*`) `attack` / `hit` when the FILE NAME ends in `_d` / `_h` /
+`_s` (+ digits) — the official naming of a skill mode's take (the normal attack's end in `_n`). It exists because the
+plan once resolved 纯烬艾雅法拉's S3 impact `p_imp_gtshpbrnch_s` as her `hit`, so her S3 impact rang on every ordinary
+hit. On today's committed manifest the client-side test is **vacuous**: `0` of the 484 unit entries carry a
+`char_*`-owned `_d`/`_h`/`_s` file for `attack` / `hit` (206 `char_*` units have either role at all; no `enemy_*` /
+`token_*` entry uses one either). The filter that does the work is the plan's own `pickUnitSfx` `normalModeBank`
+(`tools/assets/audio.mjs`), which never SELECTS such a file for an operator in the first place.
+
+So "let the manifest be authoritative" splits into two questions, and only the first has a blast radius:
+
+1. **Remove the client-side filter only** — the manifest is unchanged, so *no operator changes at all*: nothing the
+   filter currently refuses is in the manifest (0 entries). What is lost is the last line of defence: a future plan
+   regression of exactly the 纯烬艾雅法拉 kind would play again instead of being muted. Recommendation: keep it.
+2. **Also drop the plan's `normalModeBank`** (accept skill-mode files for normal attacks at the source: 25 role picks
+   over **20 operators** would change — `char_4137_udflow`, `char_253_greyy`, `char_107_liskam`, `char_279_excu`,
+   `char_4122_grabds`, `char_4054_malist`, `char_174_slbell`, `char_332_archet`, `char_474_glady`, `char_1028_texas2`,
+   `char_172_svrash`, `char_1026_gvial2`, `char_1032_excu2`, `char_1045_svash2`, `char_4064_mlynar`, `char_4193_lemuen`,
+   `char_1046_sbell2`, `char_1014_nearl2`, `char_1038_whitw2`, `char_1016_agoat2` — e.g. 银灰's attack would become
+   `p_atk_silver_n`, i.e. his S3 mode's swing, the very community report of 2026-10-06 this rule fixed). Of those 25,
+   **17 picks are `_d`/`_h`/`_s` files** that the client would then refuse anyway — including 6 operators that currently
+   have NO attack sound and would gain a refused one (`char_1028_texas2`, `char_1026_gvial2`, `char_4064_mlynar`,
+   `char_1046_sbell2`, `char_174_slbell`, `char_107_liskam`), i.e. they would still be silent while their manifest
+   claimed otherwise.
+
+Measured with `pickUnitSfx(banks, { operator: true })` vs `{ operator: false }` over `docs/research/07-assets.json`.
+**Not changed in this round** — it is an engine-level decision that rewrites 20 operators' sounds.
+
+#### 大招音被限流饿死（owner report, fixed）
+
+「现在三技能开大没有大招音效了」 was NOT the manifest (her `skills[2]` was always there, 86 KB on disk, HTTP 200)
+but the SFX limiter: `MAX_VOICES = 8` is the whole battle's concurrency budget over THREE sounds per attack (挥击 +
+音符诞生 + 音符命中), and an event sound arriving while it was full was refused outright. Measured in a browser with
+two 丰川祥子 on the field (`test/e2e/sakiko-note-sfx-probe.mjs`, which now hooks `SfxLimiter.tryAcquire` and records
+the refusal REASON):
+
+```
+=== SfxLimiter.tryAcquire calls: 101 (acquired 70, refused 31) by reason: {"perUrl":29,"voices":2}
+```
+
+The fix is `SFX_PRI` (audio.js): 技能发动 / 部署 / 阵亡 / 漏怪 are the EVENT tier, a unit's own attack / impact the
+UNIT tier, and decorations (a note's launch, a generic battle cue) the lowest. When the budget is full the LOW tier
+gives way (`popOldest`) instead of the high tier being refused, and the displaced voice is stopped immediately — so at
+most `MAX_VOICES` sounds and at most `maxPerUrl` copies of one file still sound, exactly as before. A decoration is
+never muted by this: it only never takes an event's slot.
+
+Verified after the fix, real browser, one 丰川祥子 on S3 (SP boosted so the 47-SP cast is reachable inside one round):
+
+```
+   START t=40051ms unit=1 def=char_4182_oblvns skillIndex=2 scope=2 skillUrl=…/p_skill_mjckyrdslnt_s1.mp3
+=== S3 cast cue …/p_skill_mjckyrdslnt_s1.mp3: 1 real _play calls, 1 START tuples
+=== skill-note impact sounds actually played (5 _play calls):
+      4 × p_imp_mjckyrdnt.mp3     (her talent note's impact — no cast behind those)
+      1 × p_imp_mjckyrdslnt.mp3   (S3's own impact, scope=2)
+```
+
+The two-of-her probe was run too (and is where the `voices` refusals above come from), but it never got S3 cast at all
+in that environment — one round is ~18 s, her S3 needs ~25 s of attacking to charge even with the probe's SP boost, and
+the wave dies first. The `popOldest` behaviour under a FULL budget is therefore pinned by
+`test/ui/audio.test.js` "SFX priority" (a real `AudioManager` with a saturated limiter: the cast cue still plays, the
+concurrency cap holds, a 60-unit brawl stays bounded) rather than by that browser run.
+
 **File names are lower-case**, both on disk and in the manifest: the official `audio_data.json` `asset` strings carry the
 upper case (`Audio/Sound_Beta_2/Player/p_skill/p_skill_MJCkyrdglsnt_d1`) but the dump's file **names** do not
 (`player/p_skill/p_skill_mjckyrdglsnt_d1.mp3` answers 200; the `MJC` spelling 404s), and `assetToPath` / `plan.mjs
@@ -149,12 +212,75 @@ soundAlt` lower-case the rel and the URL for every operator. Her seven skill fil
 against a manifest that said `p_skill_mjc…` — invisible on Windows, a 404 on a Linux server; they were renamed, and
 `test/sfx-oblvns.test.js` now compares the manifest's paths against the directory listing itself.
 
-Not consumed on purpose (official banks exist, the project does not read them): the skill notes' own impact banks — S1
-`ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` (`p_imp_MJCkyrdglsnt`), S2 `…projectile_chr_oblvns_s2` /
-`…_s2_slow` (`p_imp_MJCkyrdnt_r` / `…_p`), S3 `…projectile_chr_oblvns_s3_phy` / `…_s3_mag`
-(`p_imp_MJCkyrdslnt`) — because the manifest has **one** `hit` per unit and the client plays exactly that for every
-damage it can attribute to the unit; 0.1.4 shipped none of them either. (Their LAUNCH sounds are not left out any more:
-see "投射物音效" below.)
+Not consumed on purpose (official banks exist, the project does not read them): **nothing any more** — the skill notes'
+own impact banks are consumed by `skillSfx` since 「按技能细分的音效」 below (they were the last gap of her set). What
+the project still does not read of the official audio data is unrelated to her: the ~104 pool skills whose only
+activation bank is `battle.ON_ABILITY_START.<skillId>` ("技能发动音效" above), and the banks of the 13,108-entry dump
+that name no unit, projectile or UI event this game has.
+
+### 按技能细分的音效（`sfx.units[charId].skillSfx[skillIndex]`, owner report 「剩下没还原的音效全部补上」）
+
+The unit roles above are per UNIT, but the official banks of a skill's own notes are per SKILL: her S1, S2 and S3 each
+carry their own impact sound, and the client plays a unit's ONE `hit` for every damage it can attribute to her. So all
+three impacts used to play the talent note's `p_imp_MJCkyrdnt` (measured in a browser: 3 runs × one skill, 11 / 12 / 4
+impacts, one single file). The schema adds a per-skill entry, keyed by the same `skillIndex` the snapshot's UnitInfo
+carries (`skills[]` already uses it):
+
+```json
+"sfx": { "units": { "char_4182_oblvns": {
+  "skillSfx": {
+    "0": { "hit":    "/assets/audio/sfx/player/p_imp/p_imp_mjckyrdglsnt.mp3" },
+    "1": { "born":   "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdnt_r.mp3",
+           "hit":    "/assets/audio/sfx/player/p_imp/p_imp_mjckyrdnt_r.mp3",
+           "finish": "/assets/audio/sfx/player/p_skill/p_skill_mjckyrdslnt_h2.mp3" },
+    "2": { "born":   "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdnt_r.mp3",
+           "hit":    "/assets/audio/sfx/player/p_imp/p_imp_mjckyrdslnt.mp3",
+           "loop":   "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdslnt_lp.mp3" }
+} } } }
+```
+
+- **Key** = the equipped skill's 0-based index. **Roles**: `born` (the skill note's launch), `hit` (its impact),
+  `finish` (the skill's end cue), `loop` (a sustained section). Only the roles the official data carries are emitted.
+- Resolution (`tools/assets/audio.mjs SKILL_SFX_BANKS` + `skillSfx`, planned by `plan.mjs`, fetched by
+  `node tools/fetch-voice-override.mjs --sfx` — the same "explicit table + official index" shape as the tables above;
+  the banks are named after the PROJECTILE or the ABILITY, so no unit bank table can name them):
+
+| skill | role | bank(s) | file |
+| --- | --- | --- | --- |
+| S1 `skchr_oblvns_1` | `hit` | `ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` (no `ON_PROJECTILE_*` bank exists for S1) | `Player/p_imp/p_imp_MJCkyrdglsnt` |
+| S2 `skchr_oblvns_2` | `born` | `ON_PROJECTILE_BORN.projectile_chr_oblvns_s2_t`, `…_s2_slow_t` | `p_atk_MJCkyrdnt_r` (first bank wins) |
+| S2 | `hit` | `ON_PROJECTILE_HIT.projectile_chr_oblvns_s2`, `…_s2_slow` | `p_imp_MJCkyrdnt_r` |
+| S2 | `finish` | `ON_SKILL_FINISH.skchr_oblvns_2.1`, `.2` | `p_skill_MJCkyrdslnt_h2` (index order first) |
+| S3 `skchr_oblvns_3` | `born` | `…_s3_phy`, `…_s3_mag` | `p_atk_MJCkyrdnt_r` |
+| S3 | `hit` | `…_s3_phy`, `…_s3_mag` | `p_imp_MJCkyrdslnt` (one file for both halves) |
+| S3 | `loop` | `ON_BUFF_START.oblvns_s_3[loop]` (`loop: true`) | `p_atk_MJCkyrdslnt_lp` |
+| S3 | `finish` | — | **none**: `soundFXCtrlBanks` says S3's end is `ctrlStop` of that loop (0.2 s fade) |
+| S1, S2 | `loop` | — | **none**: both are `durationType NONE` (instant / toggle), there is no sustained section |
+
+- **What the client does with it** (`public/js/audio.js`):
+  - `hit`: the impact follows the ATTACK, so the skill the attack was made under travels with it (`lastAttacker` keeps
+    the index) and `unit(…, 'hit', …)` asks `skillSfx[i].hit` first. A hit with no cast behind it — every other
+    operator, and her own talent note fired outside a skill — keeps the unit's ordinary `hit`. **That fallback is the
+    contract**: a unit whose entry has no `skillSfx`, or a path where nothing is casting, sounds exactly as before.
+    An INSTANT skill (her S1) has already ended when its notes land (the sim emits start and end in the same tick —
+    measured in a browser), so a cast that ended within `IMPACT_WINDOW_MS` still counts for the impact it fired; a
+    merely EQUIPPED skill never does (equipped is not evidence that a hit is that skill's).
+  - `finish`: the sim's own `['skill', id, 0]` (技能结束) plays it. A unit without one stays silent there — the end
+    event never plays `hit` or the ordinary sound.
+  - `loop`: `['skill', id, 1]` starts it and `['skill', id, 0]` stops it (the official `ctrlStop`, 0.2 s fade), one loop
+    per UNIT so two of her never share one. It is a real Web Audio loop through the SFX channel, so 音效 volume and
+    静音 apply; `SKILL_LOOP_MAX_S` (60 s) bounds it if an end event is ever missed, and a new field stops every loop.
+    `startLoop` / `stopLoop` are the only new audio primitive; a loop deliberately does not go through `SfxLimiter`
+    (the limiter counts overlapping one-shots and a loop has no end to release).
+  - `born` is **not** played from here: that is the note's launch, and the renderer asks for it by projectile KIND
+    (`playProj` → `sfx.proj`, "投射物音效" above). The skill split of the launch is what `sfx.proj` cannot express yet
+    (`noteSkill` is one kind; see below), so the role documents it without a second playback path.
+
+Not implemented on purpose: **a finer `snap.proj` kind**. `noteSkill` covers S2 and S3 alike (S2's 钢琴/风琴 timbres
+and S3's 物理/法术 halves), so the manifest keeps one launch file per kind — S3's magic half would want `_p` where the
+kind plays `_r`. Splitting it means a third kind in the tuple, i.e. `server/sim/battle/events.js` plus her kit's
+`hitTag` — a protocol/gameplay change, deliberately not taken here (the per-skill `born` role above is where the
+resolution already lives, ready for whoever adds the kind).
 
 ### 投射物音效（`audio.sfx.proj`, owner report 「她发出音符时也应该有音效」）
 
@@ -358,10 +484,13 @@ All paths are URL paths relative to the site root, for example `/assets/char/ava
                 goodEvaluation, load, start, matchSucceed, matchFail, matchCancel, joinRoom },
       battle: { deploy, tokenDeploy, charDie, enemyDie, enemyDieHeavy, enemyHit, heal, leak, win, lose, killCoin },
       units:  { [charId|tokenId|enemyId]: { attack?, hit?, skill?, skills?: {[skillIndex]: url}, die?, born?,
+                skillSfx?: { [skillIndex]: { born?, hit?, finish?, loop? } },
                 mix?: { [attack|hit|die|born]: { p?, vol? } } } }
                 // skills[skillIndex] = that skill's own activation sound, planned from
                 // `battle.ON_SKILL_START.<skillId>` (else the audio.mjs SKILL_START_BANKS exceptions — 丰川祥子);
                 // `skill` is the fallback for a unit the client knows no skill index for ("技能发动音效" above)
+                // skillSfx[skillIndex] = the sounds one SKILL owns where the unit entry carries only ONE role
+                // ("按技能细分的音效" below); both `skillSfx` and `skills` are keyed by the snapshot's own `skillIndex`
     }
   },
   // units' mix (tools/assets/audio.mjs bankMix; community report #30): the official bank of a role's sound — `p` = the weight

@@ -445,6 +445,45 @@ voice/char_4182_oblvns/cn_019…cn_032.mp3      → 全部 200（27,603 / 8,168 
 多下约 100 个文件。这是一个**独立的引擎级决策**，本轮只修她（`--sfx --char=<id>` 会把无对应银行的技能逐个报错列出）。
 清单变化只有她的 `sfx.units.skills{0,1,2}` 与 `stats`（其他干员一条未动），测试 `test/sfx-sakiko.test.js` 11 条。
 
+## 15.1 音效还原总表（2026-10-08 更新：按技能细分 + 持续段循环 + 限流优先级）
+
+官方 bank 里她的每一条音效，**现在全部有归属**（`docs/ASSETS.md`「按技能细分的音效」是 schema 权威）：
+
+| 官方 bank | 文件 | 用途 | 状态 |
+|---|---|---|---|
+| `ON_UNIT_BORN/DED.char_4182_oblvns` | `b_char_set` / `b_char_dead` | 部署 / 阵亡（职业默认） | ✅ 0.1.4 起 |
+| `ON_ABILITY_START.char_4182_oblvns.attack.4.1` | `p_atk_mjckyrdslnt` | 普攻挥舞 | ✅ 上一轮（`UNIT_SFX_BANKS` 钉死） |
+| `ON_PROJECTILE_HIT.projectile_chr_oblvns[_talent]` | `p_imp_mjckyrdnt` | 天赋音符命中（单位 `hit`） | ✅ 上一轮 |
+| `ON_PROJECTILE_BORN.projectile_chr_oblvns_talent` | `p_atk_mjckyrdnt` | 天赋音符诞生 | ✅ 上一轮 |
+| `ON_ABILITY_START.skchr_oblvns_1` | `p_skill_mjckyrdglsnt_d1` | S1 发动 | ✅ 上一轮 |
+| `ON_SKILL_START.skchr_oblvns_2.1`（`.2` alt） | `p_skill_mjckyrdslnt_h2` | S2 发动 | ✅ 上一轮 |
+| `ON_CUSTOM_TRIGGER.skchr_oblvns_3[start]` | `p_skill_mjckyrdslnt_s1`（s2 alt） | S3 发动 | ✅ 上一轮 |
+| `ON_PROJECTILE_BORN.projectile_chr_oblvns_s2_t` / `_s2_slow_t` | `p_atk_mjckyrdnt_r` / `_p` | S2 音符诞生 | ✅ 本轮（`skillSfx[1].born`） |
+| `ON_PROJECTILE_BORN.projectile_chr_oblvns_s3_phy` / `_s3_mag` | `p_atk_mjckyrdnt_r` / `_p` | S3 音符诞生 | ✅ 本轮（`skillSfx[2].born`） |
+| `ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` | `p_imp_mjckyrdglsnt` | **S1 命中** | ✅ 本轮（`skillSfx[0].hit`） |
+| `ON_PROJECTILE_HIT.projectile_chr_oblvns_s2` / `_s2_slow` | `p_imp_mjckyrdnt_r` / `_p` | **S2 命中** | ✅ 本轮（`skillSfx[1].hit`） |
+| `ON_PROJECTILE_HIT.projectile_chr_oblvns_s3_phy` / `_s3_mag` | `p_imp_mjckyrdslnt`（同一文件） | **S3 命中** | ✅ 本轮（`skillSfx[2].hit`） |
+| `ON_SKILL_FINISH.skchr_oblvns_2.1` / `.2` | `p_skill_mjckyrdslnt_h2` / `_h1` | **S2 结束** | ✅ 本轮（`skillSfx[1].finish`） |
+| `ON_BUFF_START.oblvns_s_3[loop]`（`loop: true`） | `p_atk_mjckyrdslnt_lp` | **S3 持续段循环** | ✅ 本轮（`skillSfx[2].loop`，新原语 `startLoop`/`stopLoop`） |
+| `soundFXCtrlBanks: ON_SKILL_FINISH.skchr_oblvns_3` | —（`ctrlStop: true`, fade 0.2 s） | **S3 结束 = 停循环** | ✅ 本轮（官方没有 finish 文件，停循环就是结束音） |
+| `ON_ABILITY_ON.char_4182_oblvns.attack.{0,1,2,3,5}.1` / `combat.*` | `p_atk_mjckyrdnt_h` | 默认模式普攻音 | ⛔ **故意不消费**：客户端 `normalAttackSfx()` 会拒 `_h`（技能档文件），见 `docs/ASSETS.md` 的 C 项调查 |
+
+**仍未还原的（无）**——她官方 bank 里的音效本轮全部落地。剩下的两处是**协议/取舍**而非素材：
+
+1. **`noteSkill` 的诞生音无法再细分**：`snap.proj` 的 kind 只有 `note` / `noteSkill`，所以 `sfx.proj.noteSkill.born`
+   只能取 S2 的 `_r`；S3 的法术半段（`_s3_mag` → `_p`）与 S2 的慢速变体（`_s2_slow_t` → `_p`）在客户端听起来仍是 `_r`。
+   细分需要给 kind 加第三个值（`events.js` + 她的 kit `hitTag`），属于**协议/玩法侧改动**，本轮只报告不实现；
+   解析侧已经就绪（`skillSfx[i].born` 存的正是那两个 take）。
+2. **S2 的钢琴 / 风琴**：一个技能两种音色，官方两个 bank 各一个 take；`skillSfx[1]` 按 bank 顺序取钢琴（`_r`），
+   风琴期间听的是钢琴的 take。同上，kind 不区分音色，需要玩法侧提供信息。
+
+本轮还修了**「三技能开大没有大招音效」**（所有者实机报告）：不是清单/素材问题（`skills[2]` 一直在、文件在盘上、
+HTTP 200），而是 **SFX 限流器**——`MAX_VOICES = 8` 是全场的并发上限，两只她在场时每次攻击有 挥击 + 音符诞生 +
+音符命中 三个音，铺满后**后到的音一律被拒**，最该响的发动音被挤掉。修法见 `public/js/audio.js SFX_PRI`：
+发动 / 部署 / 阵亡 / 漏怪为事件档、普攻命中为单位档、音符诞生等装饰音为最低档，满额时**低档让位**（官方
+`maxSoundAllowed` / `popOldest` 的语义），被挤掉的音**立即停掉**因此响度不失控。回归测试
+`test/ui/audio.test.js`「SFX priority」4 条 + 「按技能细分」8 条。
+
 ## 16. Fever 的完整规格（所有者 2026-10-07 提供的官方备注原文；实现以本节为准）
 
 > Fever累计至**450点**时，任意一位 Ave Mujica 成员**手动触发技能**后，在场所有 Ave Mujica 成员 **20 秒**内会持续释放当前技能

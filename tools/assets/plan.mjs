@@ -23,7 +23,7 @@
 
 import { RAW, joinUrl, safeName, urlBase, urlDir } from './sources.mjs';
 import { kindOf } from './formats.mjs';
-import { pickUnitSfx, unitSfxBanks, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS, PROJECTILE_SFX_BANKS, projSfx } from './audio.mjs';
+import { pickUnitSfx, unitSfxBanks, skillSfx, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS, PROJECTILE_SFX_BANKS, projSfx } from './audio.mjs';
 import { literal } from './manifest.mjs';
 import { EMOTE_CATALOG } from '../../shared/constants.js';
 
@@ -479,7 +479,25 @@ export function buildPlan({ assets07, ops03, enemies05, maps05, audio, modelsDat
       born: audio.bank(`battle.ON_PROJECTILE_BORN.projectile_chr_${short}`), hit: audio.bank(`battle.ON_PROJECTILE_HIT.projectile_chr_${short}`) } }),
       ...unitSfxBanks(audio, id) };
     const { roles: u, mix } = unitSounds(audio, sfx);
-    const skillSfx = {};
+    const skillCues = {};
+    // 按技能细分 (`sfx.units[id].skillSfx`, docs/ASSETS.md): the sounds of a skill's OWN cast — its note's impact, the
+    // end cue, the sustained loop — keyed by skill index, because the manifest's unit roles are per UNIT and a skill's
+    // banks are named after its projectile / ability (audio.mjs SKILL_SFX_BANKS). Generic: a skill the table does not
+    // name contributes nothing, so every other operator's entry is written exactly as before.
+    const perSkill = {};
+    for (const i of idx) {
+      const s = (o.skills || []).find((k) => k.index === i);
+      if (!s?.skillId) continue;
+      const resolved = skillSfx(audio, s.skillId);
+      if (!resolved) continue;
+      const entry = {};
+      for (const [role, path] of Object.entries(resolved)) {
+        const a = soundAlt(path);
+        if (!a) { notes.push(`${id} ${s.skillId}.${role}: ${path} is not a sound path`); continue; }
+        entry[role] = `/assets/${a.rel}`;
+      }
+      if (Object.keys(entry).length) perSkill[String(i)] = entry;
+    }
     for (const i of idx) {
       const s = (o.skills || []).find((k) => k.index === i);
       if (!s) { notes.push(`${id}: skill index ${i} missing in research data`); continue; }
@@ -491,11 +509,12 @@ export function buildPlan({ assets07, ops03, enemies05, maps05, audio, modelsDat
       // Without a `skills[]` entry nothing is played when that skill starts (user report "放大招没音效"); the client
       // plays `sfx.units[id].skills[skillIndex]` on its own 'skill' event, so no client change is involved.
       const ss = audio.skillStart(s.skillId);
-      if (ss?.length) skillSfx[String(i)] = soundLeaf(ss);
+      if (ss?.length) skillCues[String(i)] = soundLeaf(ss);
     }
-    const primarySkill = skillSfx[String(idx[0])];
+    const primarySkill = skillCues[String(idx[0])];
     if (primarySkill) u.skill = primarySkill;
-    if (Object.keys(skillSfx).length > 1) u.skills = skillSfx;
+    if (Object.keys(skillCues).length > 1) u.skills = skillCues;
+    if (Object.keys(perSkill).length) u.skillSfx = perSkill;
     if (mix) u.mix = mix;
     if (Object.keys(u).length) unitsSfx[id] = u;
   }

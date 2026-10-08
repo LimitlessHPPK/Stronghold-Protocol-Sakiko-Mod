@@ -37,7 +37,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { VOICE_LANG_OVERRIDE, voiceAlt, soundAlt, soundAltOfUrl, projSfxLeaves, SOUND_ALTS } from './assets/plan.mjs';
-import { VOICE_BATTLE_SLOTS, SKILL_START_BANKS, indexAudio, indexVoice } from './assets/audio.mjs';
+import { VOICE_BATTLE_SLOTS, SKILL_START_BANKS, SKILL_SFX_ROLES, skillSfx, indexAudio, indexVoice } from './assets/audio.mjs';
 import { DEFAULT_GITHUB_PROXY, downloadUrls, normalizeProxyPrefix } from './assets/sources.mjs';
 import { isMp3 } from './assets/formats.mjs';
 
@@ -185,7 +185,12 @@ export function sfxJobs(skills, audioData, { charId = null, audio = null, manife
     if (charId && id !== charId) continue;
     for (const s of list || []) {
       if (!s?.skillId || (!charId && !exceptions.has(s.skillId))) continue;
-      const paths = idx.skillStart(s.skillId).slice(0, SOUND_ALTS);
+      const perSkill = skillSfx(idx, s.skillId);
+      const paths = perSkill
+        // 按技能细分 (audio.mjs SKILL_SFX_BANKS): a skill that carries its OWN roles is fetched by them — the activation
+        // cue keeps its SOUND_ALTS takes below only when the table does not name that skill
+        ? SKILL_SFX_ROLES.map((r) => perSkill[r]).filter(Boolean)
+        : idx.skillStart(s.skillId).slice(0, SOUND_ALTS);
       if (!paths.length) {
         problems.push(`${id} ${skillLabel(s)} (${s.skillId}): audio_data.json carries no activation sound`);
         continue;
@@ -204,10 +209,17 @@ export function sfxJobs(skills, audioData, { charId = null, audio = null, manife
   const mine = charId ? manifest?.audio?.sfx?.units?.[charId] : null;
   if (charId && mine && Object.keys(kinds).length) {
     // --char NARROWS the projectile kinds to the ones that operator's own manifest entry references (its URL set) — the
-    // honest "is this sound that operator's?" test that needs no new data. It only narrows when there IS an entry to
-    // read: a manifest without one (an older file, or an operator the plan does not know) keeps every kind, so a
+    // honest "is this sound that operator's?" test that needs no new data. Every STRING of the entry counts, at any
+    // depth: `skillSfx[<index>].born` carries the skill notes' own launch, which IS the `noteSkill` kind's file, and a
+    // top-level-only read would leave that kind to the default run for no reason. It only narrows when there IS an entry
+    // to read: a manifest without one (an older file, or an operator the plan does not know) keeps every kind, so a
     // --char run can over-fetch but never silently skip a file.
-    const urls = new Set(Object.values(mine).filter((v) => typeof v === 'string'));
+    const urls = new Set();
+    const collect = (v) => {
+      if (typeof v === 'string') urls.add(v);
+      else if (v && typeof v === 'object') for (const x of Object.values(v)) collect(x);
+    };
+    collect(mine);
     for (const kind of Object.keys(kinds)) {
       if (!Object.values(kinds[kind] || {}).some((u) => urls.has(u))) delete kinds[kind];
     }
