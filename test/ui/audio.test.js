@@ -394,11 +394,11 @@ describe('operator battle voice', () => {
 
 function fakeWindow() {
   const listeners = new Map();
-  const made = { sources: 0, started: 0 };
+  const made = { sources: 0, started: 0, stopped: 0 };
   class Param { constructor() { this.value = 1; } setValueAtTime(v) { this.value = v; } linearRampToValueAtTime(v) { this.value = v; } setTargetAtTime(v) { this.value = v; } cancelScheduledValues() {} }
   class Node { connect() {} disconnect() {} }
   class Gain extends Node { constructor() { super(); this.gain = new Param(); } }
-  class Src extends Node { constructor() { super(); this.playbackRate = new Param(); made.sources++; } start() { made.started++; } stop() {} }
+  class Src extends Node { constructor() { super(); this.playbackRate = new Param(); made.sources++; } start() { made.started++; } stop() { made.stopped++; } }
   class Ctx {
     constructor() { this.currentTime = 0; this.state = 'running'; this.destination = new Node(); }
     createGain() { return new Gain(); }
@@ -890,12 +890,12 @@ describe('per-skill sounds (sfx.units[id].skillSfx)', () => {
     { id: 1, side: 'ally', kind: 'chess', spine: CHAR, skillIndex: 0 },
     { id: 5, side: 'ally', kind: 'chess', spine: CHAR, skillIndex: 2 },
     { id: 2, side: 'enemy', kind: 'enemy', spine: ENEMY },
-  ]) {
+  ], getManifest = () => manifest) {
     const fw = fakeWindow();
     const origFetch = globalThis.fetch;
     const urls = [];
     globalThis.fetch = async (u) => { urls.push(u); return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) }; };
-    const a = new AudioManager({ win: fw.win, getManifest: () => manifest, random: () => 0 });
+    const a = new AudioManager({ win: fw.win, getManifest, random: () => 0 });
     a.install();
     a.setFieldUnits(units);
     fw.fire('pointerdown');            // after setFieldUnits: unlock without fetching the prep BGM (keeps counts clean)
@@ -1011,6 +1011,43 @@ describe('per-skill sounds (sfx.units[id].skillSfx)', () => {
     } finally { restore(); }
   });
 
+  test('a `_d` / `_h` / `_s` skill-mode hit IS the skill’s sound (the normal-attack guard covers the unit’s own roles only)', async () => {
+    // `normalAttackSfx` keeps an operator's skill-mode file (`_d` / `_h` / `_s`) out of its ORDINARY attack, and the
+    // official bank of a SKILL is exactly such a file: 伊内丝's S1 impact is `ON_PROJECTILE_HIT.projectile_chr_ines_s1`
+    // → `p_imp_insasn_d`. Her own three impacts avoid the pattern (asserted below), so a guard in front of
+    // `skillSfx[i].hit` was invisible for her — for most operators it would silence the whole per-skill section. The
+    // fixture below swaps her S1 impact for such a file and drives BOTH paths on the real manager.
+    const skillFile = '/assets/audio/sfx/player/p_imp/p_imp_insasn_d.mp3';   // 伊内丝 S1's impact: a `_d` file
+    assert.equal(normalAttackSfx(CHAR, skillFile), false, '前提：技能形态文件会被普通攻击的闸门拒掉');
+    for (const i of ['0', '1', '2']) {
+      assert.equal(normalAttackSfx(CHAR, her().skillSfx[i].hit), true, `她的 S${Number(i) + 1} 命中不匹配该正则 ⇒ 这处回移对她零影响`);
+    }
+    const m = structuredClone(manifest);
+    m.audio.sfx.units[CHAR].skillSfx['0'].hit = skillFile;
+    const { a, played, settle, restore } = await perSkillRig([
+      { id: 1, side: 'ally', kind: 'chess', spine: CHAR, skillIndex: 0 },
+      { id: 2, side: 'enemy', kind: 'enemy', spine: ENEMY },
+    ], () => m);
+    try {
+      // 1) 这次伤害算 S1 的：技能自己的命中音会响（闸门不作用于技能级角色）
+      a.handleBattleEvents([['skill', 1, 1], ['skill', 1, 0], ['atk', 1, 2, 'none']]);
+      await settle();
+      a.handleBattleEvents([['dmg', 2, 10, 'arts']]);
+      await settle();
+      assert.ok(playedUrl(played, skillFile), '技能自己的命中音（_d）会响');
+      // 2) 同一个文件当作单位的普通命中：仍被拒（闸门没被拆掉）
+      m.audio.sfx.units[CHAR].hit = skillFile;          // 现在它同时是她的 `hit`
+      const from = played.length;
+      a.setFieldUnits([{ id: 7, side: 'ally', kind: 'chess', spine: CHAR, skillIndex: 0 }, { id: 3, side: 'enemy', kind: 'enemy', spine: ENEMY }]);
+      a.limiter.lastByUnit.clear(); a.limiter.lastByUrl.clear();   // 排除限流（同 URL 的 45 ms gap）造成的假阴性
+      a.handleBattleEvents([['atk', 7, 3, 'none']]);    // 没有任何施放：走单位自己的 `hit`
+      await settle();
+      a.handleBattleEvents([['dmg', 3, 10, 'phys']]);
+      await settle();
+      assert.ok(!playedUrl(played, skillFile, from), '作为普通命中仍被拒');
+    } finally { restore(); }
+  });
+
   test('a cast plays the skill’s activation cue (never its `born`, which belongs to the projectile kind)', async () => {
     // `skillSfx[i].born` is the NOTE's launch — the renderer asks for it as `playProj(kind)` (sfx.proj). The 'skill'
     // event is the cast cue (`skills[i]`): reading the `born` role here would replace her 大招音 with the note's launch.
@@ -1094,6 +1131,28 @@ describe('per-skill sounds (sfx.units[id].skillSfx)', () => {
       assert.equal(a.loops.size, 0, 'a new field is a new battle');
       assert.equal(a.activeSkill.size, 0, 'and the cast scopes go with it');
       assert.equal(a.recentSkill.size, 0);
+    } finally { restore(); }
+  });
+
+  test('the end of a sustained skill FADES the loop out (official ctrlStop 0.2 s) instead of cutting it', async () => {
+    // `soundFXCtrlBanks` is 315/315 `ctrlStop: true`, 287 of them `ctrlStopFadetime: 0.2` — the official end of a
+    // sustained skill is that FADE, and for her S3 (no finish file) it is the only sound the skill ends with. The stop
+    // used to go through `startLoop(…, { on: false })`, which clears the key with `fadeS: 0`: a hard cut, so the fade the
+    // ctrl bank asks for was never heard.
+    const { a, fw, settle, restore } = await perSkillRig();
+    try {
+      a.handleBattleEvents([['skill', 5, 1]]);
+      await settle();
+      const rec = a.loops.get('skill:5');
+      assert.ok(rec?.src && rec.gain, '前提：S3 的循环在放');
+      const stopped = fw.made.stopped;
+      a.handleBattleEvents([['skill', 5, 0]]);           // S3 ends
+      await settle();
+      assert.equal(a.loops.size, 0, '结束就忘掉这个 key（同一个技能可以马上重放）');
+      assert.equal(rec.gain.gain.value, 0, '增益淡出到 0（官方 ctrlStopFadetime 0.2 s）');
+      assert.equal(fw.made.stopped, stopped, '不是硬切：结束时 source 还没有被 stop()');
+      await new Promise((r) => setTimeout(r, 300));       // 斜坡（0.2 s + 0.05 s）走完之后
+      assert.equal(fw.made.stopped, stopped + 1, '淡出走完才 src.stop() —— 这就是她 S3 的结束音');
     } finally { restore(); }
   });
 

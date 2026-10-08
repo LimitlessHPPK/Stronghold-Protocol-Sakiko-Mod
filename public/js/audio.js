@@ -1100,7 +1100,13 @@ export class AudioManager {
         : skillSfxUrl(this.getManifest(), defId, skillIndex, kind);
       const url = typeof own === 'string' ? own : u?.[kind];
       if (typeof url !== 'string') return false;
-      if ((kind === 'attack' || kind === 'hit') && !normalAttackSfx(defId, url)) return false;
+      // An operator's skill-mode file (`_d` / `_h` / `_s`) may not play as its ORDINARY attack — but a cue the manifest
+      // names FOR THE SKILL is that skill's own sound, and the official banks of a skill ARE skill-mode files: 伊内丝's
+      // S1 impact is `ON_PROJECTILE_HIT.projectile_chr_ines_s1` → `p_imp_insasn_d` (`_d`), and `normalAttackSfx` refuses
+      // it outright. So the guard applies to the unit-level role only (`own` is the `skillSfx[i].<kind>` lookup here);
+      // 丰川祥子's own three impacts (`p_imp_mjckyrdglsnt` …) happen to avoid the pattern, which is luck, not design —
+      // with the guard in front of them the whole per-skill section would silently do nothing for most operators.
+      if ((kind === 'attack' || kind === 'hit') && typeof own !== 'string' && !normalAttackSfx(defId, url)) return false;
       // the official bank's mix (header): a silent roll still counts as the unit's own sound (no generic fallback).
       // A per-skill cue has no `mix` of its own (the plan writes mix per unit role only): it plays at the base gain.
       const mix = typeof own === 'string' || kind === 'skill' ? null : u?.mix?.[kind];
@@ -1271,8 +1277,14 @@ export class AudioManager {
    * @param {boolean} on
    */
   _skillLoop(unitId, def, skillIndex, on) {
+    const key = `skill:${unitId}`;
     const url = skillSfxUrl(this.getManifest(), def, skillIndex, 'loop');
-    this.startLoop(`skill:${unitId}`, url, { on: on && typeof url === 'string', volume: 0.7 });
+    // The stop goes through `stopLoop`, NOT through `startLoop(key, url, { on: false })`: that path clears the key with
+    // `fadeS: 0`, i.e. a HARD CUT, while the official end of a sustained skill is a ctrlStop FADE — `soundFXCtrlBanks`
+    // is 315/315 `ctrlStop: true` and 287 of them carry `ctrlStopFadetime: 0.2` (= SKILL_LOOP_FADE_S). 丰川祥子's S3 has
+    // no finish file at all, so for her this fade IS the sound of the skill ending.
+    if (!on || typeof url !== 'string') { this.stopLoop(key); return; }
+    this.startLoop(key, url, { volume: 0.7 });
   }
 
   /**
