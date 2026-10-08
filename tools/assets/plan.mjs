@@ -23,7 +23,7 @@
 
 import { RAW, joinUrl, safeName, urlBase, urlDir } from './sources.mjs';
 import { kindOf } from './formats.mjs';
-import { pickUnitSfx, unitSfxBanks, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS } from './audio.mjs';
+import { pickUnitSfx, unitSfxBanks, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS, PROJECTILE_SFX_BANKS, projSfx } from './audio.mjs';
 import { literal } from './manifest.mjs';
 import { EMOTE_CATALOG } from '../../shared/constants.js';
 
@@ -180,6 +180,64 @@ export const SOUND_ALTS = 4;
 
 function soundLeaf(paths, sub = 'sfx', max = SOUND_ALTS) {
   return leaf((paths || []).slice(0, max).map((p) => soundAlt(p, sub)));
+}
+
+/**
+ * Where a manifest URL under `public/assets/audio/` comes from: the path under sound_beta_2 of its `audio/`-relative
+ * part (`/assets/audio/sfx/player/p_atk/x.mp3` → `player/p_atk/x.mp3`). The reverse of `soundAlt()`, kept next to it so
+ * a consumer that reads the committed manifest and one that reads the plan agree.
+ * @param {string} url e.g. `/assets/audio/sfx/player/p_atk/p_atk_x.mp3`
+ * @returns {string|null}
+ */
+export function soundPathOfUrl(url) {
+  const m = /^\/assets\/audio\/(?:sfx|bgm|voice)\/(.+\.mp3)$/i.exec(String(url));
+  return m ? m[1] : null;
+}
+
+/**
+ * A manifest URL under `public/assets/audio/sfx` → the download alternative of that exact file (the shape `soundAlt`
+ * returns for the same path). null when the URL is not one of ours.
+ * @param {string} url
+ * @returns {{rel:string, urls:string[], kind:string}|null}
+ */
+export function soundAltOfUrl(url) {
+  const path = soundPathOfUrl(url);
+  return path ? soundAlt(path) : null;
+}
+
+/**
+ * The content-owned projectiles' own sounds (`audio.sfx.proj`, docs/ASSETS.md "投射物音效") as manifest-template leaves,
+ * one entry per projectile kind of `audio.mjs PROJECTILE_SFX_BANKS` ('note', 'noteSkill' — the kinds `b.snap.proj`
+ * streams): `{ [kind]: { alts: [{ born: <leaf> }] } }` plus `{ urls: { [kind]: { born: '/assets/audio/sfx/…' } } }`,
+ * the same URLs resolved (what a test / the fetcher compares against, without having to resolve the template).
+ *
+ * Its own function (and not inlined into buildPlan) because TWO callers need exactly these files: the plan, which puts
+ * the leaves into the manifest, and tools/fetch-voice-override.mjs --sfx, which downloads them (a machine whose
+ * raw.githubusercontent.com is blocked cannot get them from a plain `npm run assets` — same reason that script exists
+ * for her voice and her skill cues). One definition, no drift.
+ * @param {ReturnType<import('./audio.mjs').indexAudio>} audio
+ * @returns {{ leaves: Record<string, any>, urls: Record<string, Record<string,string>>, notes: string[] }}
+ */
+export function projSfxLeaves(audio) {
+  const leaves = {};
+  const urls = {};
+  const notes = [];
+  for (const kind of Object.keys(PROJECTILE_SFX_BANKS)) {
+    const roles = projSfx(audio, kind);
+    if (!roles) { notes.push(`projectile SFX ${kind}: no bank in the official index`); continue; }
+    const entry = {};
+    const u = {};
+    for (const [role, path] of Object.entries(roles)) {
+      const a = soundAlt(path);
+      if (!a) { notes.push(`projectile SFX ${kind}.${role}: ${path} is not a sound path`); continue; }
+      entry[role] = leaf(a);                       // exactly one file per role: the manifest plays one sound, not a draw
+      u[role] = `/assets/${a.rel}`;
+    }
+    if (!Object.keys(entry).length) { notes.push(`projectile SFX ${kind}: no sound resolved`); continue; }
+    leaves[kind] = entry;
+    urls[kind] = u;
+  }
+  return { leaves, urls, notes };
 }
 
 /**
@@ -651,6 +709,11 @@ export function buildPlan({ assets07, ops03, enemies05, maps05, audio, modelsDat
   for (const [name, spec] of Object.entries(UI_SFX)) { const l = soundLeaf(resolveSpec(spec, audio.bank)); if (l) sfxUi[name] = l; else notes.push(`UI SFX ${name}: no sound`); }
   const sfxBattle = {};
   for (const [name, spec] of Object.entries(BATTLE_SFX)) { const l = soundLeaf(resolveSpec(spec, audio.bank)); if (l) sfxBattle[name] = l; else notes.push(`battle SFX ${name}: no sound`); }
+  // Content-owned projectiles (`b.snap.proj`): a note's own launch sound, by projectile kind — its own section, because
+  // it is neither a unit role (`sfx.units[id].born` is the DEPLOYMENT sound) nor a battle cue. 丰川祥子's note is the
+  // only one the current content fires; the table is keyed by KIND so any content that streams a projectile gets one.
+  const proj = projSfxLeaves(audio);
+  for (const n of proj.notes) notes.push(n);
 
   // --- module type icons ----------------------------------------------------
   const modules = {};
@@ -695,7 +758,7 @@ export function buildPlan({ assets07, ops03, enemies05, maps05, audio, modelsDat
       bgm,
       bossBgm: Object.fromEntries(Object.entries(bossBgm).sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true }))),
       voice,
-      sfx: { ui: sfxUi, battle: sfxBattle, units: unitsSfx },
+      sfx: { ui: sfxUi, battle: sfxBattle, units: unitsSfx, ...(Object.keys(proj.leaves).length ? { proj: proj.leaves } : {}) },
     },
   };
   return { template, models, notes };

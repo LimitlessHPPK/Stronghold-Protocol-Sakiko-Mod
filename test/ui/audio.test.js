@@ -154,10 +154,26 @@ describe('SfxLimiter', () => {
     const l = new SfxLimiter({ maxVoices: 99, unitCooldownMs: 100, urlGapMs: 30 });
     assert.ok(l.tryAcquire(0, 'u1', 'x'));
     assert.equal(l.tryAcquire(50, 'u1', 'y'), false, 'same unit too soon');
-    assert.equal(l.tryAcquire(10, 'u2', 'x'), false, 'same url too soon');
-    assert.ok(l.tryAcquire(40, 'u2', 'x'));
+    assert.ok(l.tryAcquire(40, 'u2', 'x'), 'the url gap is per UNIT: another unit is not blocked by u1 (see below)');
     assert.ok(l.tryAcquire(120, 'u1', 'z'));
-    assert.ok(l.tryAcquire(121, null, 'w'), 'no unit key ⇒ only url gap');
+    assert.ok(l.tryAcquire(121, null, 'w'), 'no unit key ⇒ the keyless per-url gap');
+  });
+  test('the per-url gap is per unit: two units of one character each get their own copy', () => {
+    // Owner report 「场上有两只丰川祥子时，似乎只播放其中一只的音效」. One socket message carries both units' events and
+    // they all read the same `performance.now()`, so a single global "one URL per 45 ms" stamp dropped the second
+    // unit's identical file every time. The official rule is the bank's own maxSoundAllowed 2 — two copies may overlap.
+    const l = new SfxLimiter({ maxVoices: 99, unitCooldownMs: 160, urlGapMs: 45 });
+    assert.ok(l.tryAcquire(1000, '1:attack', 'her.mp3'), 'unit 1');
+    assert.ok(l.tryAcquire(1000, '5:attack', 'her.mp3'), 'unit 5, the very same timestamp');
+    // …while ONE unit is still held to its own gap: it never flams with itself
+    assert.equal(l.tryAcquire(1000, '1:attack', 'her.mp3'), false, 'the same unit, the same instant');
+    assert.equal(l.tryAcquire(1044, '1:attack', 'her.mp3'), false, 'unit 1 again, 44 ms on');
+    assert.equal(l.tryAcquire(1000, '9:attack', 'her.mp3'), false, 'maxPerUrl 2 still caps the overlap (official)');
+    assert.equal(l.lastByUrlUnit.get('1:attack\u0000her.mp3'), 1000, 'the gap is keyed by unit AND url');
+    // a third unit joins once a copy ended (the release of a finished sound)
+    l.release('her.mp3');
+    assert.ok(l.tryAcquire(1045, '9:attack', 'her.mp3'), 'room again, 45 ms after unit 1');
+    assert.ok(l.active <= l.maxVoices);
   });
   test('at most 2 overlapping copies of one sound (official banks: maxSoundAllowed 2)', () => {
     const l = new SfxLimiter({ maxVoices: 99, unitCooldownMs: 0, urlGapMs: 0 });
@@ -644,6 +660,60 @@ describe('AudioManager', () => {
     a.voice = () => true;
     a.handleBattleEvents(ev);
     assert.equal(played.filter((u) => u === url).length, 1, 'the cast of the deployment is heard, exactly once');
+  });
+
+  /**
+   * Owner report 「场上有两只丰川祥子时，似乎只播放其中一只的音效」. Two units of one character share every sound FILE
+   * (`sfx.units[charId].attack`, and now `sfx.proj.note.born`), and one socket message carries both units' events — so
+   * both read the same `performance.now()`. A single global "one URL per 45 ms" stamp let the first unit's copy block
+   * the second unit's, every single time. `_play({ now })` is the batch's own reading (see audio.js); only that one
+   * number is faked here — the limiter, the manifest resolution and the manager are the real ones.
+   */
+  test('two 丰川祥子 on one field: each unit rings (one batch, one timestamp)', async () => {
+    const CHAR = 'char_4182_oblvns';
+    const her = manifest.audio.sfx.units[CHAR];
+    const born = manifest.audio.sfx.proj?.note?.born;
+    assert.ok(her?.attack && born, '前提：清单里有她的 attack 与音符发射音');
+    const fw = fakeWindow();
+    const urls = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => { urls.push(u); return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) }; };
+    const at = 1000;                       // the one reading a whole batch shares
+    const settle = () => new Promise((r) => setTimeout(r, 5));
+    try {
+      const a = new AudioManager({ win: fw.win, getManifest: () => manifest, random: () => 0 });
+      a.install();
+      fw.fire('pointerdown');
+      assert.ok(a.unlocked, '前提：音频已解锁，下面的路径才是真实的播放路径');
+      a.setFieldUnits([
+        { id: 1, side: 'ally', kind: 'chess', spine: CHAR }, { id: 5, side: 'ally', kind: 'chess', spine: CHAR },
+        { id: 2, side: 'enemy', kind: 'enemy', spine: 'enemy_1007_slime' }, { id: 6, side: 'enemy', kind: 'enemy', spine: 'enemy_1007_slime' },
+      ]);
+      // both attacks arrive in ONE batch: 发出音符 — the same reading for both, exactly like one socket message
+      assert.equal(a.unit(CHAR, 'attack', 1, undefined, at), true);
+      assert.equal(a.unit(CHAR, 'attack', 5, undefined, at), true);
+      await settle();
+      assert.equal(fw.made.started, 2, '两只都响：two overlapping copies of her attack cue start (official maxSoundAllowed 2)');
+      assert.equal(askedCount(urls, her.attack), 1, '两只共用同一个文件：one fetch serves both plays (the buffer is cached)');
+      assert.equal(a.limiter.activeByUrl.get(her.attack), 2, 'both copies are on air at once');
+      // the same unit again at the same timestamp: its own gap holds it back (a unit never flams with itself).
+      // `unit()` returns "such a sound exists", not "it played" (see audio.js), so the count is the evidence.
+      assert.equal(a.unit(CHAR, 'attack', 1, undefined, at), true, 'the manifest still carries her attack cue …');
+      await settle();
+      assert.equal(fw.made.started, 2, '… but no third copy started: the same unit’s own gap holds it');
+      a.limiter.release(her.attack);   // the cue ended (its safety timer / onended would do this)
+      a.limiter.release(her.attack);
+      // …and the very same rule for the note she fires: one launch per unit, one shared file
+      assert.equal(a.playProj('note', { unitId: 1, unit: CHAR, now: at }), true);
+      assert.equal(a.playProj('note', { unitId: 5, unit: CHAR, now: at }), true);
+      await settle();
+      assert.equal(fw.made.started, 4, 'two notes of two units ⇒ two launch sounds');
+      assert.equal(a.limiter.lastByUrlUnit.get(`proj:note:1\u0000${born}`), at, 'the gap is keyed by unit AND url');
+      assert.equal(a.limiter.lastByUrlUnit.get(`proj:note:5\u0000${born}`), at, 'unit 5 has an entry of its own');
+      assert.equal(a.playProj('note', { unitId: 1, unit: CHAR, now: at }), true, 'a sound exists for unit 1 …');
+      assert.equal(fw.made.started, 4, '… but its own second copy waited for the gap (still three of four sources)');
+      assert.ok(a.limiter.active <= a.limiter.maxVoices);
+    } finally { globalThis.fetch = origFetch; }
   });
 });
 

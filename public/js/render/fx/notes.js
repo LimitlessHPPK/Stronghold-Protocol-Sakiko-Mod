@@ -8,13 +8,30 @@
 // this file keeps one floating, haloed music glyph per projectile id — placed where the sim's own hit test has it, so a
 // note lands with the damage it deals. `kind` is 'note' (her talent's) or 'noteSkill' (her skills'), which picks the
 // style.js PROJ entry.
+//
+// A note is also HEARD the moment its id appears (owner report 「她发出音符时也应该有音效」): a note is born with no
+// `atk` event of its own, so this new-id branch — not `handleBattleEvents` — is the only place the launch can be played.
+// The sound is the manifest's `audio.sfx.proj[kind].born` (docs/ASSETS.md "投射物音效"; official bank
+// `ON_PROJECTILE_BORN.projectile_…`), NOT the unit's `attack` (already played for her vis-less attack) and NOT its
+// `born` (that is the DEPLOYMENT sound). Who owns the note only matters for the limiter's per-unit key: two notes born
+// in the same frame are two units' (or one unit's two volleys), and each unit must be able to have its own copy — see
+// the `lookup` below, which resolves the unit the client already knows (server-authoritative positions, client-side
+// presentation only: nothing here recomputes gameplay).
 
 import { PROJ, NOTE_FX } from '../style.js';
+import { audio } from '../../audio.js';
 import { SHOT_HEIGHT, bodyZ } from './camera.js';
 
 /** Content-owned notes (b.snap `proj`): the live cap (the oldest note is recycled past it) and the fade-out (real s) of
  *  a note that left the snapshot — the note dims and sinks away instead of popping out of existence. */
 const MAX_NOTES = 64, NOTE_FADE = 0.35;
+/**
+ * How far (board tiles) a unit may stand from a note's first position and still count as the one that fired it
+ * (`_noteOwner`): a note is born AT its caster, so the caster is the nearest unit by construction — the radius only
+ * keeps an unrelated unit that happens to stand nearby (or a stale view) from being blamed. Generous on purpose: a
+ * wrong owner changes nothing audible, a missing one only costs the per-unit limiter key.
+ */
+const NOTE_OWNER_R = 2.5;
 /** Notes: trail motes per real second of one note, and the slow float (tiles) of the glyph above its flight point. */
 const NOTE_HZ = 5, NOTE_BOB = 0.05;
 /**
@@ -37,14 +54,19 @@ export class FxNotes {
    * skills'). Called once per rendered battle frame with the list of the snapshot shown at renderT (render/app.js →
    * interp.projAt), so the note is drawn where the sim's own hit test has it:
    *   * an id that is new gets a pooled note sprite (its glyph + halo, additive, in the projectile layer) — the glyph
-   *     is one of NOTE_FRAMES picked at random for this note and kept for its whole life,
-   *   * an id that is still there is moved to its position — the same camera mapping every other projectile uses
+   *     is one of NOTE_FRAMES picked at random for this note and kept for its whole life — and its launch sound is
+   *     played (`_noteFired`: `audio.playProj(kind)`, the manifest's `sfx.proj[kind].born`),   *   * an id that is still there is moved to its position — the same camera mapping every other projectile uses
    *     (_proj + bodyZ(SHOT_HEIGHT.aim), i.e. the chest height of a unit standing on that tile),
    *   * an id that left the list (landed / faded out of range / the battle ended) flashes once in NOTE_FX, fades out
    *     over NOTE_FADE and is pooled — an empty or missing `list` fades every note out, so nothing is ever leaked.
+   *     Deliberately NO impact sound there: a note also leaves the snapshot when it expires, and the damage the sim
+   *     really dealt already plays its own cue (`public/js/audio.js handleBattleEvents`, the `dmg` attribution).
    * A note's `kind` picks PROJ.note / PROJ.noteSkill (unknown kinds fall back to PROJ.note).
+   * @param {any[]|null} list `snap.proj` entries
+   * @param {{ play?: (kind: string, o: object) => boolean }|null} [sink] where the launch sound goes (default: the app's
+   *   `audio` singleton) — injectable so a render test can count the launches without an AudioContext
    */
-  syncNotes(list) {
+  syncNotes(list, sink = null) {
     const seen = this._noteSeen || (this._noteSeen = new Set());
     seen.clear();
     if (Array.isArray(list)) {
@@ -62,12 +84,61 @@ export class FxNotes {
           n.seed = ((typeof id === 'number' ? id : this.notes.size) * 1.7) % 6.283;   // off-phase float / sway per note
           n.frame = pickNoteFrame();                                                  // 八分 / 十六分 / 高音谱号
           this.notes.set(id, n);
+          this._noteFired(e[3], x, y, sink);                                          // 发出音符: the launch sound
         }
         n.spec = PROJ[e[3]] && PROJ[e[3]].look === 'note' ? PROJ[e[3]] : PROJ.note;
         n.x = x; n.y = y; n.out = 0;
       }
     }
     for (const n of this.notes.values()) if (!seen.has(n.id)) n.out = Math.max(n.out, 1e-6);   // start its fade-out
+  }
+
+  /**
+   * 发出音符: play the launch sound of a note that just appeared (`audio.sfx.proj[kind].born`).
+   *
+   * Only the limiter's per-unit key needs to know WHO fired the note (`public/js/audio.js SfxLimiter` limits every
+   * sound per unit, so two 丰川祥子 never swallow each other's copy — owner report 「只播放其中一只的音效」). A projectile
+   * is born at its caster, and the note's first frame is exactly that point, so the nearest unit the renderer already
+   * draws is its owner (`_noteOwner`, radius NOTE_OWNER_R). That is presentation only: the positions come from the sim
+   * and nothing here recomputes gameplay. No owner within reach (an unknown attacker, a harness without a view list) ⇒
+   * the sound still plays, keyed by its kind.
+   * @param {string} kind 'note' | 'noteSkill' (unknown kinds: the manifest decides — no entry, no sound)
+   * @param {number} x board column of the note's first frame
+   * @param {number} y board row
+   * @param {{ play?: (kind: string, o: object) => boolean }|null} sink
+   */
+  _noteFired(kind, x, y, sink) {
+    try {
+      const k = typeof kind === 'string' && kind ? kind : 'note';
+      // Entering a battle (or a replay after a reconnect) hands the first frame the whole `proj` list at once — notes
+      // that were ALREADY flying are not being born now, so the first frame only seeds the sprites (`this.time` is 0
+      // until the first update(), which runs right after syncNotes in the frame; render/app.js). One frame of silence
+      // is the right price for never sounding a launch nobody just made.
+      if (!(this.time > 0)) return;
+      const who = this._noteOwner(x, y);
+      const api = sink ?? audio;
+      if (typeof api?.play !== 'function') return;
+      api.play(k, { unitId: who?.id ?? null, unit: who?.def ?? null });
+    } catch { /* a frame is never broken by a sound */ }
+  }
+
+  /**
+   * The unit a note at (x, y) was fired by: the nearest of the views the renderer draws, within NOTE_OWNER_R tiles.
+   * null when the context has no view list (a harness) or nothing stands that close.
+   * @returns {{ id: string|number, def: string|null }|null}
+   */
+  _noteOwner(x, y) {
+    const views = this.ctx?.units?.();
+    if (!views || typeof views[Symbol.iterator] !== 'function') return null;
+    let best = null;
+    for (const [id, v] of views) {
+      if (!v || !Number.isFinite(v.x) || !Number.isFinite(v.y)) continue;
+      const d = Math.hypot(v.x - x, v.y - y);
+      if (d <= NOTE_OWNER_R && (!best || d < best.d)) {
+        best = { d, id, def: (v.info?.defId ?? v.info?.spine ?? v.defId ?? v.spine ?? null) };
+      }
+    }
+    return best ? { id: best.id, def: best.def } : null;
   }
 
   /** A pooled note record: its glyph sprite + a halo (both additive, shown from the next _updateNotes). */

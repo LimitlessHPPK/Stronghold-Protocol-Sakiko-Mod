@@ -35,16 +35,28 @@ const cam = presetCamera('normal', { width: 1600, height: 900 });
 /** The three glyph frames the atlas must carry, and the weights every note is drawn from. */
 const GLYPHS = ['note', 'note16', 'treble'];
 
-/** A FxSystem on fake layers (the ctx the render frame passes), ground height 0 like the flat test fields. */
-function makeFx({ quality = 'high', load = 0 } = {}) {
+/** A FxSystem on fake layers (the ctx the render frame passes), ground height 0 like the flat test fields.
+ *  `units` is the views map app.js passes as `ctx.units()` — the FxSystem's ctx is the object handed to its
+ *  constructor, so the helper has to carry the accessor over (render/app.js does the same for `render/fx/notes.js`). */
+function makeFx({ quality = 'high', load = 0, units = null } = {}) {
   const P = fake.P;
   const ctx = fakeViewCtx(P);
   return new FX.FxSystem({
     P, layers: ctx.layers, cam: () => cam, heightAt: () => 0, settings: { quality, damageNumbers: true },
     timeScale: () => 2, loadLevel: () => load, subProfOf: () => null, view: () => null,
     screenSize: () => ({ width: 1600, height: 900 }), fieldTop: () => 120,
+    ...(units ? { units } : {}),
   });
 }
+
+/** A launch-sound sink that records what the frame asked to play (`audio.playProj`'s shape). */
+function soundSink() {
+  const calls = [];
+  return { calls, play: (kind, o) => { calls.push({ kind, ...o }); return true; } };
+}
+
+/** The views map app.js passes as ctx.units(): battle unit id → its { x, y, info } view (insertion order = discovery). */
+const unitViews = (list) => new Map(list.map((u) => [u.id, u]));
 
 /** The screen point a note at board (x, y) must be drawn at: _proj + bodyZ(SHOT_HEIGHT.aim), as every shot is. */
 const notePt = (x, y) => cam.project(x, y, FX.bodyZ(cam, { x, y, z: 0, hover: 0 }, FX.SHOT_HEIGHT.aim));
@@ -338,6 +350,100 @@ describe('syncNotes (b.snap `proj`)', () => {
     run(fx, 1);
     assert.equal(fx.notes.size, 0, 'and nothing comes back on its own');
   });
+
+  // 发出音符 (owner report 「她发出音符时也应该有音效」): a note is born with no `atk` event of its own, so the new-id
+  // branch of syncNotes is the only place its LAUNCH can be played — the manifest's `audio.sfx.proj[kind].born`, never
+  // the unit's `attack` (already plays for her vis-less attack) and never its `born` (the DEPLOYMENT sound).
+  test('a new note id asks for the launch sound of its kind — once, and only on the frame it appears', () => {
+    const fx = makeFx();
+    const sink = soundSink();
+    // the FIRST frame after entering a battle only seeds sprites (its `proj` list is everything already in flight —
+    // see the next test); every frame after it is a live battle frame
+    fx.update(DT);
+    fx.syncNotes([[1, 4, 10, 'note']], sink);
+    assert.deepEqual(sink.calls, [{ kind: 'note', unitId: null, unit: null }], '发出音符: the new id asks to be heard');
+    // the same id on the next frames: it is a known note, not a new launch
+    for (let f = 0; f < 5; f++) { fx.syncNotes([[1, 4.5 + f * 0.1, 10, 'note']], sink); fx.update(DT); }
+    assert.equal(sink.calls.length, 1, 'a known note never replays its launch');
+    // a second note of the same frame asks again (two notes are two sounds)
+    fx.syncNotes([[1, 4.6, 10, 'note'], [2, 4.1, 10, 'note']], sink);
+    assert.equal(sink.calls.length, 2, 'the newly appeared id is heard');
+    assert.equal(fx.notes.size, 2);
+    // the kind is passed through: a skill note is its own sound class in the manifest
+    fx.syncNotes([[1, 4.6, 10, 'note'], [2, 4.1, 10, 'note'], [3, 4.2, 10, 'noteSkill']], sink);
+    assert.deepEqual(sink.calls.at(-1), { kind: 'noteSkill', unitId: null, unit: null });
+    // junk entries are still dropped silently, and an unknown kind is still shown (the manifest decides if it sounds)
+    fx.syncNotes([[1, 4.6, 10, 'note'], [2, 4.1, 10, 'note'], [3, 4.2, 10, 'noteSkill'], 'x', [4, NaN, 10], [5, 1, 2]], sink);
+    assert.equal(sink.calls.length, 4, 'the malformed entry [5, 1, 2] has no kind: nothing is asked for it');
+    assert.equal(fx.notes.size, 4, '…and it is still drawn as a talent note (kind defaulting is interp’s job)');
+  });
+
+  test('the first frame of a battle only seeds: notes already in flight are not "born" for the entering client', () => {
+    // Entering a battle — or a reconnect replay — hands the first syncNotes the whole `proj` list at once. Those notes
+    // were fired before this client was watching: their launch sound must not ring for a shot nobody just made. The
+    // frame order this leans on is render/app.js's: `fx.syncNotes(interp.projAt(renderT))` runs BEFORE `fx.update(dt)`,
+    // so a fresh FxSystem is at `time === 0` for exactly its first battle frame (nothing is suppressed later).
+    const fx = makeFx();
+    const sink = soundSink();
+    assert.equal(fx.time, 0, '前提：一帧还没走过（fx.update 在 syncNotes 之后）');
+    fx.syncNotes([[1, 4, 10, 'note'], [2, 5, 10, 'noteSkill']], sink);
+    assert.deepEqual(sink.calls, [], 'no launch sound on the seeding frame');
+    assert.equal(fx.notes.size, 2, '…but both notes are drawn like any other');
+    fx.update(DT);                       // the first real frame: this client is in the battle now
+    fx.syncNotes([[1, 4.5, 10, 'note'], [2, 5.5, 10, 'noteSkill'], [3, 6, 10, 'note']], sink);
+    assert.deepEqual(sink.calls, [{ kind: 'note', unitId: null, unit: null }], 'only the genuinely new note (id 3) rings');
+    // every later frame keeps sounding (a battle reset clears the sprites, not the clock)
+    sink.calls.length = 0;
+    fx.syncNotes([[1, 4.6, 10, 'note'], [2, 5.6, 10, 'noteSkill'], [3, 6.1, 10, 'note'], [4, 7, 10, 'note']], sink);
+    assert.equal(sink.calls.length, 1, 'the frame after the next one is heard again');
+  });
+
+  test('the launch sound is keyed by the unit that fired the note (two 丰川祥子 are LIMITER-separate)', () => {
+    const CHAR = 'char_4182_oblvns';
+    const views = unitViews([
+      { id: 11, x: 3, y: 10, info: { defId: CHAR, side: 'ally' } },
+      { id: 22, x: 12, y: 10, info: { defId: CHAR, side: 'ally' } },
+      { id: 33, x: 25, y: 3, info: { defId: 'enemy_1007_slime', side: 'enemy' } },
+    ]);
+    const fx = makeFx({ units: () => views });
+    const sink = soundSink();
+    fx.update(DT);   // a live battle frame (the first frame of a battle only seeds — see the test above)
+    // two notes born in ONE frame at the two 祥子's own tiles: a projectile is born at its caster
+    fx.syncNotes([[7, 3, 10, 'note'], [8, 12, 10, 'note']], sink);
+    assert.deepEqual(sink.calls, [
+      { kind: 'note', unitId: 11, unit: CHAR },
+      { kind: 'note', unitId: 22, unit: CHAR },
+    ], 'each note names the unit it was fired by — the limiter key audio.playProj gets, so neither swallows the other');
+    // a note far from every unit (an unknown attacker, a stale view) still sounds: keyed by its kind alone
+    const lonely = soundSink();
+    fx.syncNotes([[7, 3, 10, 'note'], [8, 12, 10, 'note'], [9, 19.5, 1, 'note']], lonely);
+    assert.deepEqual(lonely.calls, [{ kind: 'note', unitId: null, unit: null }], 'no owner within reach ⇒ unkeyed, not silent');
+    // the nearest unit wins even with several candidates around (the caster is the closest by construction)
+    const two = soundSink();
+    fx.syncNotes([[7, 3, 10, 'note'], [8, 12, 10, 'note'], [9, 19.5, 1, 'note'], [10, 12.4, 10, 'note']], two);
+    assert.equal(two.calls.at(-1).unitId, 22, 'the note at 12.4 is unit 22’s (12), not far away');
+  });
+
+  test('no sink / no ctx.units() / no audio singleton: the frame never breaks and the note still draws', () => {
+    // an older harness (or any caller that does not inject a sink) uses the app's `audio` singleton, which is unlocked
+    // only after a gesture: the note must still be created and drawn, whatever the audio layer answers
+    const fx = makeFx();
+    fx.syncNotes([[1, 4, 10, 'note']]);
+    fx.update(DT);
+    assert.equal(fx.notes.size, 1);
+    assert.equal(fx.notes.get(1).core.visible, true);
+    // a sink whose play() throws is swallowed too (a sound is never allowed to cost a frame)
+    const boom = { play: () => { throw new Error('no audio'); } };
+    fx.syncNotes([[1, 4, 10, 'note'], [2, 5, 10, 'note']], boom);
+    fx.update(DT);
+    assert.equal(fx.notes.size, 2, 'the note is still made');
+    // a sink without a play function, and a ctx.units() that is not a map
+    fx.syncNotes([[1, 4, 10, 'note'], [2, 5, 10, 'note'], [3, 6, 10, 'note']], {});
+    const weird = makeFx({ units: () => 42 });
+    weird.syncNotes([[4, 6, 10, 'note']], soundSink());
+    weird.update(DT);
+    assert.equal(weird.notes.size, 1, 'a bogus view list is ignored, the note is drawn');
+  });
 });
 
 describe('interp: the snapshot `proj` list', () => {
@@ -374,5 +480,13 @@ describe('interp: the snapshot `proj` list', () => {
     const src = readFileSync(new URL('../../public/js/render/app.js', import.meta.url), 'utf8');
     assert.match(src, /fx\.syncNotes\(interp\.projAt\(renderT\)\)/,
       'render/app.js must feed interp.projAt(renderT) to fx.syncNotes each battle frame (a note has no atk event)');
+  });
+
+  test('the FX context carries the view list the launch sound resolves the firing unit from (app.js)', () => {
+    // `_noteOwner` looks a note's caster up by POSITION (a projectile is born where its caster stands); without the
+    // accessor every note would be keyed by its kind alone and two 丰川祥子 would share one limiter key again.
+    const src = readFileSync(new URL('../../public/js/render/app.js', import.meta.url), 'utf8');
+    assert.match(src, /units: \(\) => views/,
+      'render/app.js must give the FX context the field views (render/fx/notes.js `_noteOwner`)');
   });
 });

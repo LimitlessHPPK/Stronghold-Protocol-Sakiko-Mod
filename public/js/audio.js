@@ -25,10 +25,18 @@
 //   channel over — the official scheduling of `audio_data.json battleVoice.voiceTypeOptions`.
 // - Battle SFX from `b.ev` tuples (`handleBattleEvents`): at most MAX_VOICES concurrent unit sounds, at most
 //   MAX_PER_URL overlapping copies of one sound (the official banks' maxSoundAllowed 2), a per-unit cooldown and a
-//   per-URL minimum gap (SfxLimiter), so a 60-unit fight stays listenable. A `['skill', id, 1]` that arrives before its
-//   unit is known is held and played once the unit is tracked (`pendingSkill`): a unit that casts inside its own deploy
-//   tick emits that first cue before any `spawn` (or the field's unit list) reached this client, and dropping it left
-//   the one cast silent while every later one played.
+//   per-unit per-URL minimum gap (SfxLimiter), so a 60-unit fight stays listenable. A `['skill', id, 1]` that arrives
+//   before its unit is known is held and played once the unit is tracked (`pendingSkill`): a unit that casts inside its
+//   own deploy tick emits that first cue before any `spawn` (or the field's unit list) reached this client, and dropping
+//   it left the one cast silent while every later one played.
+// - The minimum gap of one sound is per UNIT, not global (owner report 「场上有两只丰川祥子时，似乎只播放其中一只的音效」):
+//   two operators of the same character fire their identical sound file milliseconds apart, and a global
+//   "one URL per 45 ms" gap silently dropped the second unit's cue whenever both arrived in the same event batch
+//   (a socket message carries both `atk` tuples, so they share one `performance.now()` reading). The official rule is the
+//   bank's own `maxSoundAllowed: 2` — two overlapping copies are allowed — so the same unit is still held to the gap
+//   (it cannot flam with itself) while two DIFFERENT units may each have theirs. Loudness stays bounded by the three
+//   caps that are not per unit: MAX_VOICES concurrent sounds for the whole battle, MAX_PER_URL overlapping copies of one
+//   file (2, the official number) and each unit's own UNIT_COOLDOWN_MS.
 // - Impact sounds (user playtest #4 item 6): a 'dmg' plays the `hit` sound of the unit whose hostile attack ('atk' on a
 //   unit of the other side) aimed at the target — once, within IMPACT_WINDOW_MS, and only for phys / arts / true damage.
 //   A heal "attack" ('atk' of a healer on an ally, chain heals) never makes the healer the author of the next damage
@@ -54,6 +62,10 @@ import { mediaUrl } from './media.js';
 
 const MAX_VOICES = 8;
 const UNIT_COOLDOWN_MS = 160;
+/**
+ * Minimum gap between two plays of the SAME file BY THE SAME UNIT (once per unit, not once for the whole battle: two
+ * operators of one character may each have their own copy of the sound — see the header).
+ */
 const URL_GAP_MS = 45;
 const MAX_PER_URL = 2;
 /**
@@ -229,6 +241,36 @@ export function normalAttackSfx(defId, url) {
 }
 
 /**
+ * A content-owned projectile's own sound (`audio.sfx.proj`, docs/ASSETS.md "投射物音效"): the projectile kinds the sim
+ * streams in `b.snap.proj` ('note' = 丰川祥子's talent note, 'noteSkill' = her skills') are sound classes of their own —
+ * her note's launch is NOT her `attack` cue, and the manifest's `born` is the DEPLOYMENT sound (`ON_UNIT_BORN`,
+ * deploySfxUrl). The URL is `/assets/audio/sfx/…`, exactly like `sfx.units[id][role]`, and the shape mirrors
+ * `sfx.units` with an optional per-unit override so a class of projectiles can be shared:
+ *
+ *   sfx.proj['<kind>'] = '<url>' | { born?, hit?, units?: { [unitId]: { born?, hit? } } }
+ *
+ * Resolution order for a shot fired by `unitId`: the unit's own entry, then the kind's. The `born` sound of a note is
+ * what this exists for; `hit` is carried by the manifest but deliberately not played — a note may leave the snapshot
+ * because it expired instead of landing (see this file's `handleBattleEvents`, where an impact sound follows the `dmg`
+ * that the SIM attributes, never the projectile's disappearance).
+ * @param {any} manifest data/assets.json
+ * @param {string} kind `snap.proj` kind ('note' | 'noteSkill' | …)
+ * @param {'born'|'hit'} [role]
+ * @param {string|null} [unitId] the unit that fired it (its `defId`/spine id), when the client knows it
+ * @returns {string|null} sound URL
+ */
+export function projSfxUrl(manifest, kind, role = 'born', unitId = null) {
+  if (typeof kind !== 'string' || !kind) return null;
+  const e = manifest?.audio?.sfx?.proj?.[kind];
+  if (!e) return null;
+  const own = unitId != null ? e.units?.[unitId] : null;
+  // the short string form is the launch sound of the kind (the role the client actually asks for)
+  const pick = (node) => (typeof node === 'string' ? (role === 'born' ? node : null)
+    : typeof node?.[role] === 'string' ? node[role] : null);
+  return pick(own) ?? pick(e);
+}
+
+/**
  * Gain of a unit's own sound with its manifest mix (sfx.units[id].mix[role]: the official bank's volume): `base` × `vol`,
  * never above `base` (a bank louder than 1 plays as before — community report #30 asked for quieter, not louder).
  * @param {number} base the role's base gain (attack / hit 0.55, die / born / skill 0.8)
@@ -324,20 +366,25 @@ export class SfxLimiter {
   constructor(o = {}) {
     this.maxVoices = o.maxVoices ?? MAX_VOICES;
     this.unitCooldownMs = o.unitCooldownMs ?? UNIT_COOLDOWN_MS;
+    // the minimum gap of one file, per unit (header): `urlGapMs` is the gap one unit must leave between two of its own
+    // copies of the same sound — different units are not in each other's way
     this.urlGapMs = o.urlGapMs ?? URL_GAP_MS;
     // the official battle banks (attack, impact, heal, born, dead…) allow at most 2 overlapping copies of a sound
     // (audio_data maxSoundAllowed 2): a heal / impact heard on every tick of a crowd never piles up
     this.maxPerUrl = o.maxPerUrl ?? MAX_PER_URL;
+    /** Keys per limiter map. A fight fields at most a few hundred units; a 4×-scenes day of battles is not a leak. */
+    this.maxKeys = Number.isFinite(o.maxKeys) ? o.maxKeys : 1200;
     this.active = 0;
     this.lastByUnit = new Map();
-    this.lastByUrl = new Map();
+    this.lastByUrlUnit = new Map();   // `${unitKey}\u0000${url}` → ms of that unit's last copy
+    this.lastByUrl = new Map();       // keyless sounds only (unitKey == null): the per-url gap of one stream
     this.activeByUrl = new Map();
   }
 
   /**
    * Whether a sound may start now; records it when allowed (call `release(url)` when it ends).
    * @param {number} now ms
-   * @param {string|number|null} unitKey e.g. `${unitId}:atk`
+   * @param {string|number|null} unitKey e.g. `${unitId}:atk` (null = no per-unit state at all)
    * @param {string} url
    */
   tryAcquire(now, unitKey, url) {
@@ -347,12 +394,16 @@ export class SfxLimiter {
       const t = this.lastByUnit.get(unitKey);
       if (t != null && now - t < this.unitCooldownMs) return false;
     }
-    const u = this.lastByUrl.get(url);
+    const urlKey = unitKey != null ? `${unitKey}\u0000${url}` : url;
+    const map = unitKey != null ? this.lastByUrlUnit : this.lastByUrl;
+    const u = map.get(urlKey);
     if (u != null && now - u < this.urlGapMs) return false;
-    if (unitKey != null) this.lastByUnit.set(unitKey, now);
-    this.lastByUrl.set(url, now);
-    if (this.lastByUnit.size > 600) this.lastByUnit.clear();
-    if (this.lastByUrl.size > 400) this.lastByUrl.clear();
+    if (unitKey != null) {
+      if (this.lastByUnit.size > this.maxKeys) this.lastByUnit.clear();
+      this.lastByUnit.set(unitKey, now);
+    }
+    if (map.size > this.maxKeys) map.clear();
+    map.set(urlKey, now);
     this.active += 1;
     this.activeByUrl.set(url, (this.activeByUrl.get(url) || 0) + 1);
     return true;
@@ -756,10 +807,13 @@ export class AudioManager {
 
   // ---- SFX ------------------------------------------------------------------------------------------------
 
-  _play(url, { volume = 1, rate = 1, limited = false, unitKey = null } = {}) {
+  _play(url, { volume = 1, rate = 1, limited = false, unitKey = null, now = null } = {}) {
     if (!this.ctx || !url || this.volumes.muted || this.volumes.sfx <= 0) return;
-    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    if (limited) { if (!this.limiter.tryAcquire(now, unitKey, url)) return; }
+    // `now` lets a caller (or a test) hand in the reading a whole batch shares: one socket message delivers several
+    // events at once and they all see the same `performance.now()`, which is exactly the case the limiter's per-unit
+    // gap has to answer correctly.
+    const t = Number.isFinite(now) ? now : typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (limited) { if (!this.limiter.tryAcquire(t, unitKey, url)) return; }
     else if (this.uiVoices >= 12) return;
     else this.uiVoices += 1;
     const release = () => { if (limited) this.limiter.release(url); else this.uiVoices = Math.max(0, this.uiVoices - 1); };
@@ -806,9 +860,11 @@ export class AudioManager {
    * @param {string} defId charId/tokenId/enemyId (or chess id — mapped via its spine/char id by the caller)
    * @param {'attack'|'hit'|'skill'|'die'|'born'} kind
    * @param {number|string} unitId battle unit id (cooldown key)
+   * @param {number} [skillIndex] the equipped skill (its own `skills[index]` cue)
+   * @param {number} [now] the batch's own clock reading (all events of one socket message share it; see _play)
    * @returns {boolean} whether a unit-specific sound exists
    */
-  unit(defId, kind, unitId, skillIndex) {
+  unit(defId, kind, unitId, skillIndex, now = null) {
     try {
       const u = this.getManifest()?.audio?.sfx?.units?.[defId];
       // DESIGN §16: the equipped skill's own ON_SKILL_START sound (`skills[index]`) when the manifest has it
@@ -819,7 +875,27 @@ export class AudioManager {
       // the official bank's mix (header): a silent roll still counts as the unit's own sound (no generic fallback)
       const mix = kind === 'skill' ? null : u?.mix?.[kind];
       if (!unitSoundPlays(mix, this.random())) return true;
-      this._play(url, { volume: unitGain(kind === 'attack' || kind === 'hit' ? 0.55 : 0.8, mix), limited: true, unitKey: `${unitId}:${kind}` });
+      this._play(url, { volume: unitGain(kind === 'attack' || kind === 'hit' ? 0.55 : 0.8, mix), limited: true, unitKey: `${unitId}:${kind}`, now });
+      return true;
+    } catch { return false; }
+  }
+
+  /**
+   * Sound of a content-owned projectile (`audio.sfx.proj`; docs/ASSETS.md "投射物音效"), limited like unit sounds. The
+   * caller is the renderer's own projectile list (`render/fx/notes.js syncNotes`), which sees a note the moment its id
+   * appears in the snapshot — a note is born with no `atk` event of its own, so this is where 「发出音符」 is heard.
+   * @param {string} kind `snap.proj` kind ('note' | 'noteSkill')
+   * @param {{ unitId?: string|number|null, unit?: string|null, role?: 'born'|'hit', volume?: number, now?: number }} [o]
+   *   `unitId` = the battle unit that fired it (the limiter's own key, so two units never swallow each other's copy);
+   *   `unit` = that unit's model id (charId), which picks a per-unit override when the manifest has one
+   * @returns {boolean} whether the manifest carries such a sound
+   */
+  playProj(kind, o = {}) {
+    try {
+      const url = projSfxUrl(this.getManifest(), kind, o.role ?? 'born', o.unit ?? null);
+      if (typeof url !== 'string') return false;
+      const key = o.unitId ?? o.unit ?? kind;
+      this._play(url, { volume: o.volume ?? 0.7, limited: true, unitKey: `proj:${kind}:${key}`, now: o.now ?? null });
       return true;
     } catch { return false; }
   }

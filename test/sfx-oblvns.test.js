@@ -36,17 +36,24 @@
 //
 // The data half is skipped when the git-ignored pieces are absent (`.cache/gamedata/excel/audio_data.json`,
 // `public/assets/**`); the committed `data/assets.json` half always runs.
+//
+// 3. 音符诞生（`audio.sfx.proj`, owner report 「她发出音符时也应该有音效」）. Her note is born with no `atk` event of
+// its own — `snap.proj` carries the position, `render/fx/notes.js syncNotes` draws it — so before this change nothing
+// played when she fired one, and the official bank that carries the launch (`ON_PROJECTILE_BORN.…_talent` →
+// `p_atk_MJCkyrdnt`) was on no machine at all. The manifest has no projectile-level section (its `sfx.units[id].born`
+// is the DEPLOYMENT sound, `ON_UNIT_BORN`), so `audio.sfx.proj` is a new, generic one keyed by the `proj` kind
+// ('note' / 'noteSkill'), resolved by audio.mjs PROJECTILE_SFX_BANKS / projSfx and planned by plan.mjs projSfxLeaves.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SKILL_START_BANKS, UNIT_SFX_BANKS, indexAudio, pickUnitSfx, unitSfxBanks } from '../tools/assets/audio.mjs';
-import { SOUND_ALTS, soundAlt } from '../tools/assets/plan.mjs';
+import { SKILL_START_BANKS, UNIT_SFX_BANKS, PROJECTILE_SFX_BANKS, indexAudio, pickUnitSfx, projSfx, unitSfxBanks } from '../tools/assets/audio.mjs';
+import { SOUND_ALTS, soundAlt, soundAltOfUrl, soundPathOfUrl, projSfxLeaves } from '../tools/assets/plan.mjs';
 import { isMp3 } from '../tools/assets/formats.mjs';
 import { parseArgs, planSkills, sfxJobs } from '../tools/fetch-voice-override.mjs';
-import { AudioManager, normalAttackSfx } from '../public/js/audio.js';
+import { AudioManager, normalAttackSfx, projSfxUrl } from '../public/js/audio.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = join(ROOT, 'public');
@@ -123,6 +130,98 @@ describe('SKILL_START_BANKS (audio.mjs): the banks the ON_SKILL_START convention
       { name: SKILL_START_BANKS.skchr_oblvns_2[1], sounds: [{ asset: 'Audio/Sound_Beta_2/P/one' }] },
     ] });
     assert.deepEqual(dup.skillStart('skchr_oblvns_2'), ['p/one.mp3']);
+  });
+});
+
+describe('PROJECTILE_SFX_BANKS (audio.mjs): 音符诞生, the launch sound of a content-owned projectile', () => {
+  const EXPECTED_BANKS = {
+    note: { born: 'battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_talent', file: 'player/p_atk/p_atk_mjckyrdnt.mp3' },
+    noteSkill: { born: 'battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_s2_t', file: 'player/p_atk/p_atk_mjckyrdnt_r.mp3' },
+  };
+
+  test('the table names the two snapshot kinds and the official banks carry their launch sound', { skip: noAudio }, () => {
+    assert.deepEqual(Object.keys(PROJECTILE_SFX_BANKS).sort(), ['note', 'noteSkill'], 'exactly the kinds b.snap.proj streams');
+    for (const [kind, want] of Object.entries(EXPECTED_BANKS)) {
+      const banks = PROJECTILE_SFX_BANKS[kind];
+      assert.deepEqual(Object.keys(banks), ['born'], `${kind}: a launch sound (no impact: see the table's comment)`);
+      assert.equal(banks.born[0], want.born, `${kind}: the bank the resolver reads first`);
+      for (const name of banks.born) {
+        assert.match(name, /^battle\.ON_PROJECTILE_BORN\./, `${kind}: ${name} is a projectile-born bank`);
+        assert.ok(audio.bank(name).length, `${kind}: ${name} carries sounds`);
+      }
+      assert.deepEqual(projSfx(audio, kind), { born: want.file }, `${kind}: the file the manifest will play`);
+    }
+    assert.equal(projSfx(audio, 'somethingElse'), null, 'a kind the table does not name stays silent');
+    assert.equal(projSfx(null, 'note'), null, 'no audio index ⇒ no resolution (never a crash)');
+  });
+
+  test('her skill notes resolve to real banks too — S2/S3 share the two takes, and the manifest keeps one', { skip: noAudio }, () => {
+    // WHY the manifest plays `_r` for `noteSkill` and not `_p`: the snapshot distinguishes just two kinds, so the
+    // resolver's first bank wins (`_s2_t` → `_r`). S3 uses the same files (`_s3_phy` → `_r`, `_s3_mag` → `_p`), and
+    // S2's slow variant carries `_p` — a per-skill split would need a third kind in the tuple (docs/ASSETS.md).
+    assert.deepEqual(audio.bank('battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_s2_t'), ['player/p_atk/p_atk_mjckyrdnt_r.mp3']);
+    assert.deepEqual(audio.bank('battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_s2_slow_t'), ['player/p_atk/p_atk_mjckyrdnt_p.mp3']);
+    assert.deepEqual(audio.bank('battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_s3_phy'), ['player/p_atk/p_atk_mjckyrdnt_r.mp3']);
+    assert.deepEqual(audio.bank('battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_s3_mag'), ['player/p_atk/p_atk_mjckyrdnt_p.mp3']);
+    // and a kind no bank is listed for cannot resolve, however many projectile banks the index has
+    assert.equal(projSfx(audio, 'projectile_chr_oblvns_talent'), null, 'bank names are not kinds');
+  });
+
+  test('projSfx is generic: another unit\'s projectile banks resolve the same way', () => {
+    const idx = indexAudio({ soundFXBanks: [
+      { name: 'battle.ON_PROJECTILE_BORN.projectile_chr_x_talent', sounds: [{ asset: 'Audio/Sound_Beta_2/P/one' }] },
+      // the same bank twice with two takes: the manifest wants ONE file per role, the first sound of the first bank
+      { name: PROJECTILE_SFX_BANKS.noteSkill.born[0], sounds: [{ asset: 'Audio/Sound_Beta_2/P/r' }, { asset: 'Audio/Sound_Beta_2/P/p' }] },
+    ] });
+    assert.deepEqual(projSfx(idx, 'noteSkill'), { born: 'p/r.mp3' }, 'first sound, not a list of takes');
+    assert.equal(projSfx(idx, 'note'), null, 'a kind whose only bank the index does not carry is silent, not a crash');
+  });
+
+  test('plan.mjs projSfxLeaves: the template leaf and the URL of every kind agree', () => {
+    // one bank per kind, so the whole table resolves and the empty-section path below is the only one that reports
+    const banks = Object.entries(PROJECTILE_SFX_BANKS)
+      .flatMap(([kind, roles]) => roles.born.map((name) => ({ name, sounds: [{ asset: `Audio/Sound_Beta_2/P/${kind}` }] })));
+    const { leaves, urls, notes } = projSfxLeaves(indexAudio({ soundFXBanks: banks }));
+    assert.deepEqual(notes, [], 'every bank resolved');
+    assert.deepEqual(Object.keys(leaves), Object.keys(PROJECTILE_SFX_BANKS), 'one entry per kind');
+    assert.deepEqual(leaves.note.born.alts.map((a) => a.rel), ['audio/sfx/p/note.mp3'], 'audio/sfx/<bank path>');
+    assert.deepEqual(urls.note.born, '/assets/audio/sfx/p/note.mp3', 'the URL the client resolves');
+    assert.deepEqual(leaves.noteSkill.born.alts.map((a) => a.rel), ['audio/sfx/p/noteskill.mp3']);
+    // a missing index: reported, never a silent empty section
+    const empty = projSfxLeaves(indexAudio({ soundFXBanks: [] }));
+    assert.deepEqual(empty.leaves, {});
+    assert.deepEqual(empty.urls, {});
+    assert.equal(empty.notes.length, Object.keys(PROJECTILE_SFX_BANKS).length, 'one note per kind');
+  });
+
+  test('soundAltOfUrl / soundPathOfUrl: a manifest URL back to its download alternative', () => {
+    for (const kind of Object.keys(PROJECTILE_SFX_BANKS)) {
+      const url = projSfxLeaves(audio ?? indexAudio({ soundFXBanks: [] })).urls[kind];
+      if (!url) continue;
+      const a = soundAltOfUrl(url.born);
+      assert.ok(a, `${url.born} is one of our audio URLs`);
+      assert.equal(a.rel, `audio/sfx/${soundPathOfUrl(url.born)}`, 'the path plan.mjs soundAlt would compute');
+    }
+    assert.equal(soundPathOfUrl('/assets/audio/sfx/player/p_atk/x.mp3'), 'player/p_atk/x.mp3');
+    assert.equal(soundPathOfUrl('/assets/char/avatar/char_1.png'), null, 'not an audio URL');
+    assert.equal(soundAltOfUrl('https://example.com/x.mp3'), null);
+  });
+
+  test('projSfxUrl (the client): the kind, then the optional per-unit override', () => {
+    const vm = { audio: { sfx: { proj: {
+      note: { born: '/assets/audio/sfx/p/note_born.mp3', hit: '/assets/audio/sfx/p/note_hit.mp3',
+        units: { char_a: { born: '/assets/audio/sfx/p/a_born.mp3' } } },
+      flat: '/assets/audio/sfx/p/flat.mp3',
+    } } } };
+    assert.equal(projSfxUrl(vm, 'note', 'born', 'char_a'), '/assets/audio/sfx/p/a_born.mp3', 'the unit override wins');
+    assert.equal(projSfxUrl(vm, 'note', 'born', 'char_b'), '/assets/audio/sfx/p/note_born.mp3', 'the kind default');
+    assert.equal(projSfxUrl(vm, 'note', 'hit', 'char_a'), '/assets/audio/sfx/p/note_hit.mp3', 'a role the unit has none of');
+    assert.equal(projSfxUrl(vm, 'note', 'born'), '/assets/audio/sfx/p/note_born.mp3', 'no unit known');
+    assert.equal(projSfxUrl(vm, 'flat', 'born'), '/assets/audio/sfx/p/flat.mp3', 'the short string form');
+    assert.equal(projSfxUrl(vm, 'flat', 'hit'), null, 'a short form is the launch sound, not a hit');
+    assert.equal(projSfxUrl(vm, 'nope'), null);
+    assert.equal(projSfxUrl(null, 'note'), null);
+    assert.equal(projSfxUrl({ audio: { sfx: {} } }, 'note'), null, 'a manifest without the section is silent');
   });
 });
 
@@ -203,10 +302,10 @@ describe('fetch-voice-override.mjs --sfx: the jobs are the plan\'s own files', (
   });
 
   test('one job per alternative of every SKILL_START_BANKS skill; the proxy comes first, then the raw URL', { skip: noAudio }, () => {
-    const jobs = sfxJobs(skills, null, { audio });
-    assert.deepEqual(jobs.problems, []);
+    const { jobs, problems } = sfxJobs(skills, null, { audio });
+    assert.deepEqual(problems, []);
     // the plan's cap decides how many alternatives of one bank travel (plan.mjs soundLeaf(SOUND_ALTS))
-    assert.deepEqual(jobs.jobs.map((j) => [j.skillId, j.skill, j.rel]), [
+    assert.deepEqual(jobs.map((j) => [j.skillId, j.skill, j.rel]), [
       ['skchr_oblvns_1', 'S1', soundAlt(EXPECTED.skchr_oblvns_1.files[0]).rel],
       ['skchr_oblvns_1', 'S1', soundAlt('player/p_skill/p_skill_mjckyrdglsnt_d2.mp3').rel],
       ['skchr_oblvns_1', 'S1', soundAlt('player/p_skill/p_skill_mjckyrdglsnt_d3.mp3').rel],
@@ -215,14 +314,35 @@ describe('fetch-voice-override.mjs --sfx: the jobs are the plan\'s own files', (
       ['skchr_oblvns_3', 'S3', soundAlt('player/p_skill/p_skill_mjckyrdslnt_s1.mp3').rel],
       ['skchr_oblvns_3', 'S3', soundAlt('player/p_skill/p_skill_mjckyrdslnt_s2.mp3').rel],
     ]);
-    for (const j of jobs.jobs) {
+    for (const j of jobs) {
       assert.equal(j.charId, CHAR, 'only her: the table names her three skills');
       assert.match(j.rel, /^audio\/sfx\/player\/p_skill\/p_skill_[a-z0-9_]+\.mp3$/, 'the path plan.mjs soundAlt computes');
       assert.deepEqual(j.urls, [`https://gh-proxy.com/${rawOf(j.rel)}`, rawOf(j.rel)], 'the mirror policy: proxy, then raw');
     }
-    assert.ok(jobs.jobs.length <= 3 * SOUND_ALTS, `${SOUND_ALTS} alternatives per skill at most`);
+    assert.ok(jobs.length <= 3 * SOUND_ALTS, `${SOUND_ALTS} alternatives per skill at most`);
     // the rel is exactly the file the plan keeps, so the fetcher and the plan cannot drift
-    for (const j of jobs.jobs) assert.equal(j.rel, soundAlt(j.rel.replace(/^audio\/sfx\//, '')).rel);
+    for (const j of jobs) assert.equal(j.rel, soundAlt(j.rel.replace(/^audio\/sfx\//, '')).rel);
+  });
+
+  test('the projectile sounds travel with the same run: one job per kind, at the manifest\'s own rel', { skip: noAudio }, () => {
+    // Without these the fix is silent on any machine whose raw.githubusercontent.com is blocked: `p_atk_MJCkyrdnt` was
+    // in no checkout before this change (the plan resolved it only after PROJECTILE_SFX_BANKS existed).
+    const { jobs, problems } = sfxJobs(skills, null, { audio, proj: projSfxLeaves(audio).urls });
+    assert.deepEqual(problems, []);
+    const proj = jobs.filter((j) => j.kind);
+    assert.deepEqual(proj.map((j) => [j.kind, j.skill, j.rel]), [
+      ['note', 'note.born', 'audio/sfx/player/p_atk/p_atk_mjckyrdnt.mp3'],
+      ['noteSkill', 'noteSkill.born', 'audio/sfx/player/p_atk/p_atk_mjckyrdnt_r.mp3'],
+    ]);
+    for (const j of proj) {
+      assert.equal(j.charId, null, 'a projectile sound belongs to a KIND, not to one operator');
+      assert.deepEqual(j.urls, [`https://gh-proxy.com/${rawOf(j.rel)}`, rawOf(j.rel)], 'the same proxy policy');
+      // the rel is the manifest's own URL (plan.mjs projSfxLeaves), so the fetcher and the manifest cannot drift
+      assert.equal(j.rel, soundAlt(soundPathOfUrl(projSfxLeaves(audio).urls[j.kind].born)).rel);
+    }
+    // a manifest that predates the section and no resolved `proj`: the skill jobs keep their exact shape
+    assert.deepEqual(sfxJobs(skills, null, { audio }).jobs.filter((j) => j.kind), []);
+    assert.deepEqual(sfxJobs(skills, null, { audio, proj: null }).jobs.filter((j) => j.kind), []);
   });
 
   test('--char widens the scope to that operator; a skill without a sound and an unknown operator are reported', { skip: noAudio }, () => {
@@ -241,6 +361,32 @@ describe('fetch-voice-override.mjs --sfx: the jobs are the plan\'s own files', (
       `${CHAR} S2 (skchr_oblvns_2): audio_data.json carries no activation sound`,
       `${CHAR} S3 (skchr_oblvns_3): audio_data.json carries no activation sound`,
     ], 'only the table skills are looked at without --char');
+  });
+
+  test('--char keeps the projectile kinds that operator\'s manifest entry points at', { skip: !manifest && 'data/assets.json not generated (run npm run assets)' }, () => {
+    const proj = projSfxLeaves(audio ?? indexAudio({ soundFXBanks: [] })).urls;
+    const her0 = manifest?.audio?.sfx?.units?.[CHAR];
+    if (!her0) return;   // a manifest without her entry: nothing to judge (the branches below cover those cases)
+    // The ownership test is "does any URL of that operator's own manifest entry equal this kind's file": it needs no new
+    // data and cannot claim another unit's sound. Her three note files are all takes of one instrument and NO unit entry
+    // carries them — her `attack` is the swing (`p_atk_MJCkyrdslnt`, ON_ABILITY_START.attack.4.1), the note's launch is
+    // the projectile bank's `p_atk_MJCkyrdnt` and her `hit` is `p_imp_MJCkyrdnt` — so a `--char=char_4182_oblvns` run
+    // fetches only her skills, and the projectile sounds come with the default (no --char) run. That is the safe
+    // direction: the default run is what puts a new 自选 operator's set on disk (docs/ASSETS.md 普攻 / 命中音效).
+    assert.equal(her0.attack, V014.attack, '前提：她的 attack 是挥舞声，不是音符的发射音');
+    assert.notEqual(proj.note.born, her0.attack, '两种声音各有一个文件：atk 事件与音符诞生都会响');
+    const mine = sfxJobs(skills, null, { audio, manifest, proj, charId: CHAR });
+    assert.deepEqual(mine.jobs.filter((j) => j.kind), [], 'a --char run stays the operator\'s own skill sounds');
+    assert.deepEqual(mine.jobs.map((j) => j.skill), ['S1', 'S1', 'S1', 'S2', 'S2', 'S3', 'S3'], 'her seven skill files');
+    // A run without --char takes every kind; another operator's --char run stays exactly the jobs it had before; and a
+    // --char run with no unit entry to read (an older manifest, an operator the plan does not know) keeps every kind:
+    // the narrowing only ever happens when there IS an entry, so a --char run over-fetches at worst.
+    assert.deepEqual(sfxJobs(skills, null, { audio, manifest, proj }).jobs.filter((j) => j.kind).map((j) => j.kind), ['note', 'noteSkill']);
+    assert.deepEqual(sfxJobs(skills, null, { audio, manifest, proj, charId: 'char_102_texas' }).jobs.filter((j) => j.kind), []);
+    assert.deepEqual(sfxJobs(skills, null, { audio, manifest: null, proj, charId: CHAR }).jobs.filter((j) => j.kind).map((j) => j.kind),
+      ['note', 'noteSkill'], 'no manifest to judge by ⇒ fetch every kind (over-fetch, never under-fetch)');
+    assert.deepEqual(sfxJobs(skills, null, { audio, manifest: { audio: { sfx: { units: {} } } }, proj, charId: CHAR }).jobs.filter((j) => j.kind).map((j) => j.kind),
+      ['note', 'noteSkill'], 'no entry for that operator ⇒ every kind again');
   });
 });
 
@@ -311,6 +457,49 @@ describe('the manifest, the files on disk and the client', () => {
     // a unit without a skillIndex still gets her S1 cue through the `skill` fallback the manifest carries
     assert.equal(a.unit(CHAR, 'skill', 2, undefined), true);
     assert.equal(played[3], her().skill);
+  });
+
+  test('the manifest carries audio.sfx.proj: one launch sound per snapshot kind, /assets/audio/sfx/*.mp3', { skip: noManifest }, () => {
+    const proj = manifest.audio.sfx.proj;
+    assert.ok(proj, 'the section exists (a manifest without it means a client that never plays 音符诞生)');
+    assert.deepEqual(Object.keys(proj).sort(), ['note', 'noteSkill'], 'the kinds b.snap.proj streams');
+    for (const [kind, want] of Object.entries({ note: 'p_atk_mjckyrdnt.mp3', noteSkill: 'p_atk_mjckyrdnt_r.mp3' })) {
+      assert.deepEqual(Object.keys(proj[kind]), ['born'], `${kind}: born only — the impact stays the client's dmg attribution`);
+      assert.match(proj[kind].born, /^\/assets\/audio\/sfx\/player\/p_atk\/p_atk_[a-z0-9_]+\.mp3$/, kind);
+      assert.ok(proj[kind].born.endsWith(want), `${kind} ⇒ ${want} (the official bank's file)`);
+      // the file name is lower case, like every other path in the manifest (a Linux server is case-sensitive)
+      assert.equal(proj[kind].born, proj[kind].born.toLowerCase(), `${kind}: no upper-case spelling`);
+    }
+    assert.notEqual(proj.note.born, proj.noteSkill.born, 'the skill note has its own take');
+    assert.notEqual(proj.note.born, her().hit, 'the launch is not the impact');
+    assert.notEqual(proj.note.born, her().attack, 'the launch is not her atk-event cue (both are heard)');
+    assert.notEqual(proj.note.born, her().born, 'the launch is NOT the deployment sound (ON_UNIT_BORN)');
+    // the manifest's own numbers: this fix added FILES, no unit and no other section
+    assert.ok(manifest.stats.files >= 8003, `${manifest.stats.files} files listed`);
+    assert.equal(manifest.stats.sfxUnits, Object.keys(manifest.audio.sfx.units).length);
+  });
+
+  test('the launch sound is a real mp3 on disk, in exactly the case the manifest spells', { skip: noAssets }, () => {
+    for (const [kind, url] of Object.entries(manifest.audio.sfx.proj)) {
+      const file = join(PUBLIC, url.born.replace(/^\/assets\//, 'assets/'));
+      assert.ok(existsSync(file), `${kind}: ${url.born} is on disk (node tools/fetch-voice-override.mjs --sfx)`);
+      assert.ok(readdirSync(dirname(file)).includes(basename(file)), `${kind}: exact name on disk (a case-only mismatch is a 404 on Linux)`);
+      assert.ok(isMp3(readFileSync(file)), `${kind}: ${url.born} is an MP3`);
+    }
+  });
+
+  test('the client plays it: AudioManager.playProj(kind) → the manifest URL, per unit', { skip: noManifest }, () => {
+    const a = new AudioManager({ win: null, getManifest: () => manifest });
+    a.ctx = {};
+    const played = [];
+    a._play = (url, o) => { played.push([url, o.unitKey]); };
+    assert.equal(a.playProj('note', { unitId: 1, unit: CHAR }), true, '发出音符 has a sound now');
+    assert.deepEqual(played, [[manifest.audio.sfx.proj.note.born, `proj:note:1`]], 'the kind’s launch sound');
+    assert.equal(a.playProj('noteSkill', { unitId: 5, unit: CHAR }), true);
+    assert.deepEqual(played[1], [manifest.audio.sfx.proj.noteSkill.born, 'proj:noteSkill:5'], 'the skill kind, its own unit');
+    assert.equal(a.playProj('nope', { unitId: 1, unit: CHAR }), false, 'an unknown kind is silent');
+    assert.equal(a.playProj('note', { unitId: 1, unit: 'char_000_nobody' }), true, 'the kind default needs no owner');
+    assert.equal(played.at(-1)[0], manifest.audio.sfx.proj.note.born);
   });
 
   test('one ordinary attack: her attack cue (vis "none") and its note\'s impact, from the real event stream', { skip: noManifest }, () => {

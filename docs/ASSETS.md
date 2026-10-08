@@ -153,9 +153,65 @@ Not consumed on purpose (official banks exist, the project does not read them): 
 `ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` (`p_imp_MJCkyrdglsnt`), S2 `…projectile_chr_oblvns_s2` /
 `…_s2_slow` (`p_imp_MJCkyrdnt_r` / `…_p`), S3 `…projectile_chr_oblvns_s3_phy` / `…_s3_mag`
 (`p_imp_MJCkyrdslnt`) — because the manifest has **one** `hit` per unit and the client plays exactly that for every
-damage it can attribute to the unit; 0.1.4 shipped none of them either. `ON_PROJECTILE_BORN.projectile_chr_oblvns_talent`
-(`p_atk_MJCkyrdnt`, the note's launch) is not written anywhere: the plan's `projectile.born` is a fallback for the
-`attack` role, while the manifest's `born` is the **deployment** sound (`ON_UNIT_BORN`, `audio.js deploySfxUrl`).
+damage it can attribute to the unit; 0.1.4 shipped none of them either. (Their LAUNCH sounds are not left out any more:
+see "投射物音效" below.)
+
+### 投射物音效（`audio.sfx.proj`, owner report 「她发出音符时也应该有音效」）
+
+A content-owned projectile is born with **no `atk` event of its own**: the sim streams its positions in `b.snap.proj`
+(`[[id, x, y, kind]]`, `server/sim/battle/events.js`) and `render/fx/notes.js syncNotes` draws one glyph per id. So until
+this section existed, 丰川祥子 firing a note was completely silent — and the official bank that carries that launch
+(`battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_talent` → `Player/p_atk/p_atk_MJCkyrdnt`) was on no machine at all,
+because only a real download run ever fetches a file, and the plan never resolved it.
+
+Schema (generic: nothing here names an operator; the client asks for a KIND):
+
+```json
+"audio": { "sfx": { "proj": {
+  "note":      { "born": "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdnt.mp3" },
+  "noteSkill": { "born": "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdnt_r.mp3" }
+} } }
+```
+
+- **Key** = the `kind` of a `snap.proj` entry: `note` (the talent's) and `noteSkill` (the skills'), i.e. the two the sim
+  emits today (`server/sim/content/kits/ops/op-oblvns.js`, `render/style.js PROJ`). An unknown kind is simply silent.
+- **Roles**: `born` (the launch — what the client plays) and `hit` (carried by the schema for a future per-kind impact;
+  **not played**: a note also leaves the snapshot when it *expires*, so an impact sound hung on the disappearance would
+  ring for a miss. The impact the sim really dealt plays the normal `dmg` attribution, `audio.js handleBattleEvents`).
+- A kind may also be a plain URL string (treated as `born`) or carry `units: { [charId]: { born?, hit? } }`, a per-unit
+  override resolved before the kind's own entry (`public/js/audio.js projSfxUrl`). The generator writes neither: her
+  note's launch is its own bank, and a per-unit entry would only duplicate `sfx.units[charId].attack`.
+- **Why the launch is not `sfx.units[id].born`**: that role is the DEPLOYMENT sound (`ON_UNIT_BORN` → `b_char_set`,
+  `audio.js deploySfxUrl`). And it is not `sfx.units[id].attack` either: her note's launch (`p_atk_MJCkyrdnt`) and her
+  attack cue (`p_atk_MJCkyrdslnt`, the swing bank) are two different files — both are heard, one per event.
+
+Resolution (`tools/assets/audio.mjs PROJECTILE_SFX_BANKS` + `projSfx`, the same "explicit table + official index" shape
+as `SKILL_START_BANKS` / `UNIT_SFX_BANKS`; a projectile bank is named after the PROJECTILE, so no unit bank table can
+name it):
+
+| kind | role | bank(s) | file |
+| --- | --- | --- | --- |
+| `note` | `born` | `battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_talent` | `Player/p_atk/p_atk_MJCkyrdnt` |
+| `noteSkill` | `born` | `…_s2_t`, `…_s2_slow_t`, `…_s3_phy`, `…_s3_mag` | `p_atk_MJCkyrdnt_r` (first bank wins) |
+
+Her **skill** notes' other takes — S2's slow variant `…_s2_slow_t` (`p_atk_MJCkyrdnt_p`) and S3's magic half
+(`…_s3_mag` → `…_p`) — need no separate entry *yet*: the snapshot distinguishes exactly two kinds, so a per-skill split
+would mean a third `kind` in the tuple (a sim change), not a resolution change. The **impact** banks of those same
+projectiles (`p_imp_MJCkyrdnt_r` / `_p` / `p_imp_MJCkyrdglsnt` / `p_imp_MJCkyrdslnt`) stay unplanned for the reason
+above: one `hit` per unit, played for every damage attributed to it.
+
+Planned by `plan.mjs projSfxLeaves` (one file per role, never a draw) and fetched by
+`node tools/fetch-voice-override.mjs --sfx` — the same proxy-first route as her voice and her skill cues, because the
+whole `voice` branch has no jsDelivr mirror. The `--char` filter reads the operator's own manifest URLs to decide which
+kinds are its; a `--char` run therefore fetches only its skill sounds (no unit entry references the note's launch file:
+`attack` is the swing, `hit` is `p_imp_MJCkyrdnt`), and the projectile sounds come with the default (no `--char`) run.
+
+**Two 丰川祥子 are heard separately** (owner report 「只播放其中一只的音效」): every battle sound is limited per UNIT
+(`public/js/audio.js SfxLimiter`), and the note's limiter key is the unit the renderer resolves as its owner — a
+projectile is born at its caster, so the nearest view within 2.5 tiles is it (`render/fx/notes.js _noteOwner`, from
+`ctx.units()` that `render/app.js` passes; presentation only, the positions stay the sim's). The first frame of a battle
+only seeds its sprites (`this.time === 0`: entering a battle or a reconnect replay hands the whole `proj` list at once,
+and those notes were fired before this client watched) — from the second frame on, every new id sounds.
 
 Outputs:
 - `data/assets.json`: the manifest (committed).
@@ -194,7 +250,7 @@ The research JSONs in `docs/research/` (03, 05, 07) define **which** ids are nee
 | Enemy Spine that no dump carries (灼热源石虫 / 炽焰源石虫) | the local client only (`tools/local-extract/extract.py ENEMY_SPINES`, optional); never downloaded and never required: an overlay of the web alias (`enemies[id].spineLocal`) | `local/spine/enemy/{enemyId}/{stem}.*` (listed in `data/local-assets.json`) |
 | Token Spine that no dump carries (39 summons: most 自选 summons, 凯瑟琳's 爬行号·防护单元, 凛御银灰's 风雪之眼) | the local client only (`tools/local-extract/extract.py TOKEN_SPINES`, optional); never downloaded and never required: an overlay (`tokens[id].spineLocal`; without it the avatar diamond) | `local/spine/token/{tokenId}/{stem}.*` (listed in `data/local-assets.json`) |
 | BGM | AA2 `voice` branch `audio/sound_beta_2/music/**` (大厅/休整期 `act1autochess`, 开战 `act13side/m_bat_kazimierz2_{1,2}` — 骑士之日 / 无畏者; the 开战 track follows the round: `_2` 无畏者 rounds 1–7, `_1` 骑士之日 from round 8) | `audio/bgm/{file}.mp3` |
-| SFX (UI, battle, per unit) | AA2 `voice` `audio/sound_beta_2/**`, mapped from `audio_data.json` banks | `audio/sfx/{same sub-path}.mp3` |
+| SFX (UI, battle, per unit, per projectile kind) | AA2 `voice` `audio/sound_beta_2/**`, mapped from `audio_data.json` banks | `audio/sfx/{same sub-path}.mp3` |
 | 干员战斗语音 | AA2 `voice` `audio/sound_beta_2/voice_cn/{charId}/cn_nn.mp3` — the lines `charword_table.json` lists (`placeType` = when the game plays one, `voiceAsset` = the path); `--voice-lang=jp|en|kr` takes the same file names from `voice/`, `voice_en/`, `voice_kr/` | `audio/voice/{lang}/{charId}/{cn_nn}.mp3` |
 | Fonts: Bender Regular and Light, Novecento Wide | TimWangZi/The-font-of-Arknights | `public/fonts/*.{otf,ttf,woff2}`, `public/fonts/fonts.css` |
 

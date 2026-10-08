@@ -8,7 +8,9 @@
 // the whole collaboration is like that: 祐天寺若麦 / 三角初华 / 若叶睦 are 404 there too). plan.mjs
 // VOICE_LANG_OVERRIDE is what sends her entries to the JP dump; this script is what puts the files on disk. `--sfx`
 // does the same for her three skill activation sounds, whose banks are named differently from
-// `battle.ON_SKILL_START.<skillId>` (audio.mjs SKILL_START_BANKS; user report "放大招没音效").
+// `battle.ON_SKILL_START.<skillId>` (audio.mjs SKILL_START_BANKS; user report "放大招没音效"), and for the launch sound
+// of her 音符 (audio.mjs PROJECTILE_SFX_BANKS / manifest `audio.sfx.proj`; user report "音符诞生没有音效" — the file
+// `p_atk_MJCkyrdnt` was on no machine, because only a real download run ever fetches it).
 //
 // `node tools/fetch-assets.mjs` alone cannot do it on a machine whose hosts file sends raw.githubusercontent.com to
 // 127.0.0.1: the voice branch has no jsDelivr mirror at all (sources.mjs mirrorUrl returns null for it), so a direct
@@ -34,7 +36,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { VOICE_LANG_OVERRIDE, voiceAlt, soundAlt, SOUND_ALTS } from './assets/plan.mjs';
+import { VOICE_LANG_OVERRIDE, voiceAlt, soundAlt, soundAltOfUrl, projSfxLeaves, SOUND_ALTS } from './assets/plan.mjs';
 import { VOICE_BATTLE_SLOTS, SKILL_START_BANKS, indexAudio, indexVoice } from './assets/audio.mjs';
 import { DEFAULT_GITHUB_PROXY, downloadUrls, normalizeProxyPrefix } from './assets/sources.mjs';
 import { isMp3 } from './assets/formats.mjs';
@@ -46,6 +48,8 @@ const AUDIO_DATA = path.join(ROOT, '.cache', 'gamedata', 'excel', 'audio_data.js
 /** The two inputs of the plan's operator table: research 07's records and the 自选 picks (fetch-assets.mjs dataExtras). */
 const ASSETS07 = path.join(ROOT, 'docs', 'research', '07-assets.json');
 const BACKUPS = path.join(ROOT, 'data', 'backups.json');
+/** The committed manifest: read only, for `--char`'s "is this sound that operator's?" test (sfxJobs). */
+const MANIFEST = path.join(ROOT, 'data', 'assets.json');
 /** The slots are read from the zh_CN table, whose voiceIds are always `CN_*` (plan.mjs VOICE_ID_LANG). */
 const VOICE_ID_LANG = 'CN';
 /** curl's name differs per platform (the script is shipped for Windows dev boxes and Linux servers alike). */
@@ -59,9 +63,10 @@ const CACHE_HINT = 'run node tools/build-data.mjs first (the official tables are
 const HELP = `Usage: node tools/fetch-voice-override.mjs [options]
   --dry-run         list the files and whether each one is already on disk, then exit
   --force           re-download even when a valid file is already there
-  --sfx             fetch the skill activation sounds of the SKILL_START_BANKS operators instead of battle voice
-                    (docs/research/07-assets.json + data/backups.json and .cache/gamedata/excel/audio_data.json are
-                    read; each skill of the operator that the plan gives a sound is written to
+  --sfx             fetch the skill activation sounds of the SKILL_START_BANKS operators AND the content-owned
+                    projectiles' own sounds (plan.mjs projSfxLeaves / manifest audio.sfx.proj — 丰川祥子's note launch)
+                    instead of battle voice (docs/research/07-assets.json + data/backups.json and
+                    .cache/gamedata/excel/audio_data.json are read; each sound the plan gives is written to
                     public/assets/audio/sfx/<bank path>.mp3)
   --char=<charId>   only this operator (default: every key of plan.mjs VOICE_LANG_OVERRIDE, or of the SKILL_START_BANKS
                     operators with --sfx)
@@ -149,18 +154,24 @@ export function planSkills(assets07, backups) {
  * The skill activation sounds to fetch: one job per alternative of every skill sound the plan resolves, so the rel each
  * job writes is the very path the manifest will point at (plan.mjs soundAlt / audio.mjs skillStart — one definition).
  *
- * Without `--char` the scope is the SKILL_START_BANKS skills: the ones whose official banks the
- * `battle.ON_SKILL_START.<skillId>` convention cannot express, which are also the ones a plain `npm run assets` run on
- * a machine without raw.githubusercontent.com never gets (the whole voice branch has no jsDelivr mirror).
- * `--char=<charId>` widens it to every skill of that operator that has an activation sound — and then reports the ones
- * that have none (the ~104 pool skills whose bank is only `ON_ABILITY_START.<skillId>`, a known gap this script
- * deliberately does not close).
+ * Without `--char` the scope is the SKILL_START_BANKS skills and the content-owned projectiles of `projSfx` (the plan's
+ * `audio.sfx.proj`: 丰川祥子's note launch, whose bank lives on the same voice branch and is missing for the same
+ * reason — 发出音符 had no sound at all, owner report); both are sounds a plain `npm run assets` on a machine without
+ * raw.githubusercontent.com never gets (the whole voice branch has no jsDelivr mirror).
+ * `--char=<charId>` narrows the skill half to that operator's skills (and reports the ones without an activation sound —
+ * the ~104 pool skills whose bank is only `ON_ABILITY_START.<skillId>`, a known gap this script deliberately does not
+ * close) and narrows the projectile half to the kinds that operator's manifest entry references.
  * @param {Map<string, Array<{index:number, skillId:string}>>} skills from planSkills()
  * @param {any} audioData parsed excel/audio_data.json (null when the cache is missing)
- * @param {{charId?:string|null, audio?:ReturnType<import('./assets/audio.mjs').indexAudio>}} [o]
- * @returns {{jobs:{charId:string,skill:string,skillId:string,rel:string,urls:string[]}[], problems:string[]}}
+ * @param {{charId?:string|null, audio?:ReturnType<import('./assets/audio.mjs').indexAudio>,
+ *   manifest?:any, proj?:Record<string, Record<string,string>>}} [o]
+ *   `manifest` (optional) = the committed data/assets.json: `--char` reads its `sfx.units[id]` URLs to decide which
+ *   projectile kinds that operator's own sounds are (no manifest ⇒ every kind is planned, which over-fetches, never
+ *   under-fetches); `proj` = plan.mjs projSfxLeaves().urls (resolved at fetch time from the official index, and the
+ *   fallback for a URL the manifest does not carry yet).
+ * @returns {{jobs:{charId:string|null,skill:string,skillId?:string,kind?:string,rel:string,urls:string[]}[], problems:string[]}}
  */
-export function sfxJobs(skills, audioData, { charId = null, audio = null } = {}) {
+export function sfxJobs(skills, audioData, { charId = null, audio = null, manifest = null, proj = null } = {}) {
   const jobs = [];
   const problems = [];
   if (!audio && !audioData) {
@@ -184,6 +195,28 @@ export function sfxJobs(skills, audioData, { charId = null, audio = null } = {})
         if (!a) { problems.push(`${id} ${skillLabel(s)}: ${p} is not a sound path`); continue; }
         jobs.push({ charId: id, skill: skillLabel(s), skillId: s.skillId, rel: a.rel, urls: downloadUrls(a.urls[0], { source: 'mirror', proxyPrefix }) });
       }
+    }
+  }
+  // Content-owned projectiles (plan.mjs projSfxLeaves / audio.sfx.proj): the launch sound of a note. The URL is the
+  // manifest's own, so the fetcher and the plan cannot drift; `proj` (resolved from the index) is the fallback for a
+  // run whose committed manifest predates the section.
+  const kinds = proj && Object.keys(proj).length ? { ...proj } : {};   // a copy: the filter below must not touch the caller's
+  const mine = charId ? manifest?.audio?.sfx?.units?.[charId] : null;
+  if (charId && mine && Object.keys(kinds).length) {
+    // --char NARROWS the projectile kinds to the ones that operator's own manifest entry references (its URL set) — the
+    // honest "is this sound that operator's?" test that needs no new data. It only narrows when there IS an entry to
+    // read: a manifest without one (an older file, or an operator the plan does not know) keeps every kind, so a
+    // --char run can over-fetch but never silently skip a file.
+    const urls = new Set(Object.values(mine).filter((v) => typeof v === 'string'));
+    for (const kind of Object.keys(kinds)) {
+      if (!Object.values(kinds[kind] || {}).some((u) => urls.has(u))) delete kinds[kind];
+    }
+  }
+  for (const [kind, roles] of Object.entries(kinds)) {
+    for (const [role, url] of Object.entries(roles)) {
+      const a = soundAltOfUrl(url);
+      if (!a) { problems.push(`projectile SFX ${kind}.${role}: ${url} is not a /assets/audio URL`); continue; }
+      jobs.push({ charId: null, skill: `${kind}.${role}`, kind, rel: a.rel, urls: downloadUrls(a.urls[0], { source: 'mirror', proxyPrefix }) });
     }
   }
   if (charId && !jobs.length && !problems.length) {
@@ -229,7 +262,12 @@ async function main() {
     if (!existsSync(ASSETS07)) throw new Error(`no ${path.relative(ROOT, ASSETS07)}`);
     const backups = existsSync(BACKUPS) ? JSON.parse(readFileSync(BACKUPS, 'utf8')) : null;
     const skills = planSkills(JSON.parse(readFileSync(ASSETS07, 'utf8')), backups);
-    ({ jobs, problems } = sfxJobs(skills, JSON.parse(readFileSync(AUDIO_DATA, 'utf8')), opts));
+    const audioData = JSON.parse(readFileSync(AUDIO_DATA, 'utf8'));
+    // the committed manifest is read for --char's ownership test (see sfxJobs); projSfxLeaves resolves the projectile
+    // sounds from the official index, so a manifest that predates `audio.sfx.proj` still gets its files fetched
+    const manifest = existsSync(MANIFEST) ? JSON.parse(readFileSync(MANIFEST, 'utf8')) : null;
+    const proj = projSfxLeaves(indexAudio(audioData)).urls;
+    ({ jobs, problems } = sfxJobs(skills, audioData, { ...opts, manifest, proj }));
   } else {
     if (!existsSync(CHARWORD)) throw new Error(`no ${path.relative(ROOT, CHARWORD)} — ${CACHE_HINT}`);
     ({ jobs, problems } = voiceJobs(JSON.parse(readFileSync(CHARWORD, 'utf8')), opts));
@@ -240,7 +278,7 @@ async function main() {
   let ok = 0, kept = 0, failed = 0, bytes = 0;
   for (const job of jobs) {
     const dest = path.join(ASSETS, job.rel);
-    const label = `${job.charId} ${(sfx ? job.skill : job.slot).padEnd(12)} ${job.rel}`;
+    const label = `${(job.charId || '——').padEnd(18)} ${(sfx ? job.skill : job.slot).padEnd(13)} ${job.rel}`;
     if (!opts.force && existsSync(dest) && isMp3(readFileSync(dest))) {
       kept++; console.log(`[keep] ${label}`);
       continue;

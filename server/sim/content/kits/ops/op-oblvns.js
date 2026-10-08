@@ -19,8 +19,9 @@
 //      engine's own `noSp`), the engine's automatic casts are suspended (`rule: 'NEVER'`) and only Fever's own releases
 //      fire — free («不消耗技力»), outside the SP limit («无视技力限制»), at the kit's own FEVER_CAST_GAP, with the
 //      switch skill (S2) excluded; a sustained skill that ran when Fever started has its clock frozen and gets it back
-//      when Fever ends; a sustained skill Fever opened is ended with it; S1's charge-cap auto release does not trigger
-//      Fever (§17).
+//      when Fever ends; a sustained skill Fever opened is ended with it; S1's charge-cap auto release — the cap's own
+//      extra effect (`chargeCapRelease`: 「可充能2次，充能至最大层数时自动释放一次」), which the engine's trigger rules
+//      do NOT provide — does not trigger Fever (§17), while every other activation does (§16).
 //    * The notes: one note per attack (talent 1 「攻击会演奏追踪敌人的音符」), the damage of a note is
 //      `ATK × profile.dmgMul` snapshotted at LAUNCH (PRTS 「所有音符强制使用缓存攻击力与攻击倍率」), the talent's
 //      DEF / RES penetration per note in flight («每存在一个音符…3% 防御力和 2% 法术抗性（最多 10 层）») written with
@@ -245,6 +246,46 @@ function feverCast(battle, unit, st) {
   // `activate` started the engine's AUTO_OP_COOLDOWN (3 s) on her; ours is the shorter, Fever-specific gap.
   sk.opReadyAt = battle.time + FEVER_CAST_GAP;
   if (sk.isTimed) st.opened.add(sk);
+}
+
+/**
+ * The activation reason of the CAP RELEASE below. §17 S1's one exception is written against it: 「因充能到达上限自动释放
+ * 时，不会触发 Fever」 — the release the charge cap itself causes is the only activation Fever leaves out; every other one
+ * (the mode's own automatic cast, a manual press, a kit's activate) counts (「本模式是全自动放技能：任意一次技能发动
+ * （含自动）在蓄满时即可触发」, §16).
+ */
+const CHARGE_FULL = 'chargeFull';
+
+/**
+ * S1 新月的苏醒 「可充能2次，充能至最大层数时自动释放一次」 — the release the CAP causes, in its own right.
+ *
+ * PRTS 技能 §特殊属性 / 可充能: 「一些技能中存在"可充能X次"的描述，其实际效果为当前技力上限等于该技能技力需求的X倍，
+ * 从而实现可连续释放该技能的效果…部分可充能技能在技力达到上限后（即充能次数达到上限）会立刻产生额外效果，如立刻释放
+ * 一次」. It is therefore an EXTRA EFFECT of reaching the cap, not one of the trigger rules:
+ *   * it needs no target — her notes fly out and hunt for themselves (PRTS 天赋备注 「攻击范围内不存在敌人时…发射的音符
+ *     初始不存在追踪目标」), and 持续攻击 means she may well be attacking into an empty range when the cap arrives;
+ *   * it waits for nothing: no attack, no `AUTO_OP_COOLDOWN` — 「自动操作具有3s冷却，在完成一次操作…将进入冷却」 is about
+ *     an OPERATION, and this release is the skill's own effect (so the operation's cooldown is left exactly as it was,
+ *     which is also what lets her spend the charge that is left over right afterwards: 「从而实现可连续释放」);
+ *   * it stands aside inside Fever: «Fever 期间，此技能将被持续地触发» — the state's own releases are the ones firing.
+ *
+ * WHY THIS HAS TO EXIST AT ALL. The kit used to leave the release to the engine's DEFAULT trigger, which requires an enemy
+ * inside her INITIAL range at attack time (`skills.js` `_defaultCondition`). Her 持续攻击 keeps playing notes whose
+ * contacts still pay her attack SP, so with nothing in her range the charges climbed to the cap and STAYED there: the
+ * skill never released and the SP bar read full the whole time (snapshot.js publishes `sp`/`spCost`, and `gainSp` pins
+ * `sp` at `spCost` exactly when `charges == maxCharges`) — 技能条满了却不发动技能，而是继续普通攻击.
+ */
+function chargeCapRelease(battle, unit) {
+  const sk = unit?.skill;
+  if (!sk || sk.noSkill || sk.kind !== 'charges' || sk.maxCharges <= 1) return false;
+  if (!live(unit) || !unit.canAct || unit.s.flags.silence) return false;   // a stunned / silenced unit releases nothing
+  if (sk.charges < sk.maxCharges || (sk.active && sk.isTimed)) return false;
+  if (feverState(battle, unit).left > 0) return false;                     // «Fever 期间，此技能将被持续地触发»
+  const opReadyAt = sk.opReadyAt;
+  let ok = false;
+  try { ok = sk.activate(CHARGE_FULL) === true; } catch { /* a kit error here must not break the battle */ }
+  sk.opReadyAt = opReadyAt;   // the cap's extra effect is not an 自动操作: it must not spend the operation's cooldown
+  return ok;
 }
 
 /**
@@ -718,7 +759,8 @@ export default {
         // 至右 13.125° 顺时针均匀演奏音符（间隔 3.75°）」: the i-th note leaves on the fixed ray `S1_FAN_HALF − 3.75·i`
         // (left first, clockwise to the right). Targets are picked as each note leaves her, so a later note follows the
         // field as it is then; with nothing in range the whole run still plays out (each note flying out and hunting).
-        // 可充能 2 次 (`maxChargeTime`) — the auto-release of the last charge is left to the ordinary DEFAULT trigger.
+        // 可充能 2 次 (`maxChargeTime`) — 「充能至最大层数时自动释放一次」 is the CAP's own extra effect, not a trigger
+        // rule, so the kit releases it itself (`chargeCapRelease`, registered in the talent below).
         [S1]: {
           kind: 'charges',
           onStart({ battle, unit }) {
@@ -793,15 +835,14 @@ export default {
           //   * Fever never opens it either («切换类技能除外», feverCast skips it)
           // The frozen `sk.toggle` marker lets feverCast recognise the switch skill without hard-coding the id there.
           const ownSkill = unit.skill;
-          // §17 S1: 「因充能到达上限自动释放时，不会触发 Fever」 — the engine's own automatic cast has to be told apart
-          // from that release, so the one thing to know before the cast is whether the charge was already at max; the
-          // wrapper leaves that on the skill (non-enumerable) and the skillStart handler below decides.
-          if (ownSkill && ownSkill.kind === 'charges' && ownSkill.maxCharges > 1 && !Object.prototype.hasOwnProperty.call(ownSkill, 'activate')) {
-            const activate = ownSkill.activate;
-            Object.defineProperty(ownSkill, 'activate', {
-              configurable: true, writable: true, enumerable: false,
-              value(reason, opts) { ownSkill.sakikoChargeFull = this.charges >= this.maxCharges; return activate.call(this, reason, opts); },
-            });
+          // S1's 充能 cap (`chargeCapRelease` above): 「充能至最大层数时自动释放一次」. Registered in TWO places, because
+          // the SP that reaches the cap can arrive in either half of a step and the release has to beat the engine's own
+          // cast to it: the `tick` hook (after the projectiles — where one of her notes LANDING pays her attack SP) fires
+          // it the moment the cap is reached, and the member timer below runs before the allies phase of the next step,
+          // so the operation can never cast at the cap first (that cast would be an operation's, and §17's exception is
+          // about the CAP's own release — see the skillStart handler below).
+          if (ownSkill && ownSkill.kind === 'charges' && ownSkill.maxCharges > 1) {
+            battle.on('tick', () => { chargeCapRelease(battle, unit); }, { owner: unit });
           }
           if (ownSkill && ownSkill.id === S2 && !Object.prototype.hasOwnProperty.call(ownSkill, 'activate')) {
             const activate = ownSkill.activate;
@@ -876,6 +917,7 @@ export default {
             }
 
             if (!live(unit)) return;
+            chargeCapRelease(battle, unit);   // 「充能至最大层数时自动释放一次」, before this step's attack can be cast instead
             applyNotePen(battle, unit, penCfg);
 
             // --- 持续攻击: she attacks on her own cadence even with nothing in range (PRTS 术语「持续攻击」:
@@ -925,14 +967,18 @@ export default {
 
           // Fever is triggered by a skill activation made while the TEAM gauge is FULL (「Fever累计至450点时，任意一位 Ave
           // Mujica 成员手动触发技能后」 — and this mode casts skills automatically, so ANY activation counts, not only a
-          // manual press; §17's one exception is S1 below). Whoever casts it, every member of that player enters.
+          // manual press; §17's one exception is S1's cap release below). Whoever casts it, every member of that player enters.
           battle.on('skillStart', (ctx) => {
             if (ctx.unit !== unit || ctx.reason === 'fever') return;   // Fever's own releases never re-trigger it
-            const sk = unit.skill;
             // §17 S1: 「因充能到达上限自动释放时，不会触发 Fever。不论是因 Fever 还是因满充能，自动释放始终不改变技能为
-            // 手动触发的本质」 — only the release the charge cap itself causes stays out (the flag the wrapper above left);
-            // every OTHER automatic cast is this mode's own 自动作战 and does trigger Fever, and a manual press always does.
-            if (sk?.kind === 'charges' && sk.sakikoChargeFull && ctx.reason !== 'manual') return;
+            // 手动触发的本质」 — the release the charge cap ITSELF causes (chargeCapRelease) is the one activation that stays
+            // out. Everything else counts, the engine's own automatic cast (this mode's 自动作战, the stand-in for the
+            // manual press the official 备注 asks for) and a manual press alike: the old charge-STATE test could not tell
+            // 「the cap released it」 from 「the operation pressed while the charges happened to be full」, and at any real
+            // 攻速 (4 attacks per charge faster than the operation's 3 s cooldown, i.e. an attack interval under 0.75 s /
+            // ASPD ≳ 173 — her own talent aura +16 and module +12 plus one 攻速 item already cross it) that swallowed EVERY
+            // release and left S1 unable to trigger Fever at all — see 12-sakiko.md §16/§17.
+            if (ctx.reason === CHARGE_FULL) return;
             if (feverState(battle, unit).gauge < FEVER_MAX) return;    // 蓄满（450）才可触发
             enterFever(battle, unit);
           }, { owner: unit });

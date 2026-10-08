@@ -29,7 +29,7 @@ import { KITTED_CHARS, OPERATOR_KITS, KITS } from '../../server/sim/content/kits
 import { diyPool, validateDiyPicks } from '../../shared/diy.js';
 import { composeUnitRecord } from '../../shared/standIn.js';
 import { frontOf } from '../../server/sim/dir.js';
-import { FORCED_EXIT } from '../../server/sim/constants.js';
+import { FORCED_EXIT, AUTO_OP_COOLDOWN } from '../../server/sim/constants.js';
 
 const load = (f) => JSON.parse(readFileSync(new URL(`../../data/${f}.json`, import.meta.url), 'utf8'));
 const CHESS = load('chess');
@@ -235,11 +235,13 @@ test('her ordinary attack IS a note: one attack = ONE damage instance (tag talen
     assert.ok(h.hooksOf('attack').filter((c) => c.attacker === u).length >= 3, `T${tier}: she kept attacking (持续攻击)`);
     done(h);
   }
-  // with a target: exactly one instance per attack, and it is the note's (the skill held back: only plain attacks)
+  // with a target: exactly one instance per ATTACK, and it is the note's (the engine's own cast held back: only plain
+  // attacks. S1's own release is a second, `skill` tagged layer and fires on its own — the cap release is the skill's
+  // extra effect, not a trigger rule: §17 / the test below — so the attack carrier is what `isAttack` isolates here)
   const { h, u } = field({ skill: 0 });
   hold(u);
   h.run(12);
-  const mine = hitsOf(h, u);
+  const mine = hitsOf(h, u, 'talent');
   assert.ok(mine.length > 5, `her notes landed (${mine.length})`);
   assert.deepEqual([...new Set(mine.map((c) => (c.dmg.tags ?? []).join('+')))], ['talent'], 'every instance is a talent note');
   assert.deepEqual([...new Set(mine.map((c) => c.dmg.type))], ['arts'], 'the note deals arts damage');
@@ -832,30 +834,139 @@ test('蓄满（450）时任意一次技能发动触发 Fever: 全员进入 20 �
   done(h);
 });
 
-test('S1 的充能满自动释放不触发 Fever，普通的自动发动会 (§17)', () => {
-  // §17 S1:「因充能到达上限自动释放时，不会触发 Fever…自动释放始终不改变技能为手动触发的本质」. The engine's own release and
-  // that one have to be told apart: the kit marks the charge state before the cast and the skillStart handler decides.
-  const autoRelease = (sp) => {
-    const { h, u } = field({ tier: 5, elite: false, skill: 0 });
-    h.run(0.2);
+test('S1 「充能至最大层数时自动释放一次」: 攻击范围内没有敌人也释放（SP 满了不再干等普攻），这一次不触发 Fever (§17)', () => {
+  // PRTS 技能 §特殊属性 / 可充能:「部分可充能技能在技力达到上限后（即充能次数达到上限）会立刻产生额外效果，如立刻释放
+  // 一次」 — the cap release is the skill's own EXTRA EFFECT, not a trigger rule: the engine's DEFAULT rule needs an enemy
+  // inside her INITIAL range at attack time, and none of its rules fires with an empty range. Her 持续攻击 still plays
+  // notes that reach enemies OUTSIDE the range and those contacts pay her attack SP, so the charges used to climb to the
+  // cap and stay there for ever (the SP bar reads full exactly then: snapshot sp/spCost, and `gainSp` pins `sp` at
+  // `spCost` when charges == max) — the owner's 技能条满了却不发动技能，而是继续普通攻击.
+  const { h, u } = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 9] }] });   // 5 tiles ahead: outside her 0-3 range
+  const sk = u.skill;
+  let releasedAt = null;
+  h.b.on('skillStart', (c) => { if (c.unit === u && !releasedAt) releasedAt = { reason: c.reason, charges: sk.charges }; });
+  let sawEmptyRange = false;
+  for (let i = 0; i < 30 * 40 && !h.b.finished && !releasedAt; i++) {
+    h.step(1);
+    if (!h.b.enemiesInKeys(u.rangeKeys, u, u.profile).length) sawEmptyRange = true;
+  }
+  assert.ok(sawEmptyRange, 'she never had a target in her range (持续攻击 fed her SP)');
+  assert.ok(releasedAt, 'the cap released the skill by itself');
+  assert.equal(releasedAt.reason, 'chargeFull', 'it is the cap release (§17 「因充能到达上限自动释放」)');
+  assert.equal(releasedAt.charges, sk.maxCharges - 1, `it released FROM the cap (${sk.maxCharges} charges in store)`);
+  // …and the skill keeps cycling instead of parking at 2/2 with a full bar
+  const cap = sk.maxCharges * sk.spCost;
+  assert.ok(sk.charges * sk.spCost + sk.sp < cap, `not parked at a full charge (${sk.charges}/${sk.maxCharges}, sp ${sk.sp})`);
+  assert.equal(u.mem.sakikoFeverLeft, 0, 'the gauge was never full here');
+  done(h);
+
+  // §17 in its own right: a cap release at a FULL gauge does NOT trigger Fever (「因充能到达上限自动释放时，不会触发
+  // Fever」), while every other activation does — the next test.
+  const g = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 9] }] });
+  const sk2 = g.u.skill;
+  assert.equal(sk2.rule, 'DEFAULT', 'the engine\'s own cast is not held here');
+  g.h.run(1);
+  chargeGauge(g.h, g.u, g.h.enemies()[0]);
+  assert.equal(g.u.mem.sakikoFever, FEVER_MAX, 'the gauge is full');
+  const n0 = castsOf(g.h, g.u).length;
+  g.h.runUntil(() => castsOf(g.h, g.u).length > n0, 30);
+  const cast = castsOf(g.h, g.u).slice(n0)[0];
+  assert.ok(cast, 'the cap released it');
+  assert.equal(cast.reason, 'chargeFull', 'again the cap release');
+  assert.equal(g.u.mem.sakikoFeverLeft, 0, '§17: 因充能到达上限自动释放时，不会触发 Fever');
+  assert.equal(g.u.findBuff('sakiko:fever'), null, 'and no marker');
+  done(g.h);
+});
+
+test('S1 的常规自动发动（自动作战）在蓄满时触发 Fever —— 攻速堆到 4 次攻击充满一层、技能停在满充能上也一样 (§16/§17)', () => {
+  // The owner's first symptom. The kit used to decide by the charge STATE at cast time (`charges >= maxCharges`) that a
+  // cast was 「因充能到达上限自动释放」 and excluded it. At base 攻速 the refill of one charge (spCost attacks) is slower
+  // than the engine's 3 s 自动操作 cooldown (AUTO_OP_COOLDOWN), so the operation cast at 1 charge and all was well — but
+  // any real 攻速 stack (items, her own talent aura, the module) puts 4 attacks per charge BELOW those 3 s, and then the
+  // charges are always back at the cap when the cooldown expires: EVERY release was taken for a cap release and S1 could
+  // not trigger Fever at all. The exception belongs to the cap release, never to a cast of the operation.
+  const { h, u } = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 9] }] });   // outside her range: no cast of the operation
+  const sk = u.skill;
+  h.b.addBuff(u, { key: 'test:aspd', mods: { aspd: 100 }, persist: true });
+  assert.ok(u.s.interval * sk.spCost < AUTO_OP_COOLDOWN, `4 attacks per charge (${(u.s.interval * sk.spCost).toFixed(2)} s) beat the ${AUTO_OP_COOLDOWN} s cooldown`);
+  // 1) the skill reaches the cap with an empty range: the cap release fires (one charge back in store). A build without it
+  //    simply parks the charges at 2/2 — the state that used to mislabel every later cast — and this test fails where the
+  //    owner's report is (the release below, at a full gauge, must trigger Fever).
+  let cap = null;
+  h.b.on('skillStart', (c) => { if (c.unit === u && !cap) cap = c.reason; });
+  h.runUntil(() => !!cap || sk.charges >= sk.maxCharges, 40);
+  assert.ok(cap || sk.charges >= sk.maxCharges, 'the skill filled up with nothing in range');
+  assert.equal(u.mem.sakikoFeverLeft, 0, 'nothing has triggered Fever yet');
+  // 2) the gauge is filled by damage, then an enemy steps into her range: the operation casts at the charge it HAS, and at a
+  //    full gauge that cast is a 技能发动 like any other (§16) → Fever.
+  chargeGauge(h, u, h.enemies()[0]);
+  assert.equal(u.mem.sakikoFever, FEVER_MAX, 'the gauge is full');
+  const n0 = castsOf(h, u).length;
+  h.spawn('enemy_far', { pos: [10, 6] });
+  h.runUntil(() => castsOf(h, u).length > n0, 10);
+  const cast = castsOf(h, u).slice(n0)[0];
+  assert.ok(cast, 'she cast when the enemy came into her range');
+  assert.notEqual(cast.reason, 'chargeFull', 'it is the operation\'s cast, not the cap\'s extra effect');
+  assert.ok(u.mem.sakikoFeverLeft > 0, 'and it triggered Fever (the release the owner never got)');
+  done(h);
+});
+
+test('Fever 的压制不是永久的: 到时间 / 她退场 / 被击倒（免死→强制退场）/ 再部署 / 战斗结束 之后规则都回到原值', () => {
+  // The kit suspends the engine's automatic cast of every member for the window (`sk.rule = 'NEVER'`, §16 「禁止常规自动
+  // 发动」) and puts the original rule back when the state ends. This pins that every END PATH gives it back — a rule stuck
+  // at NEVER would silently disable her skill for the rest of the battle.
+  /** She is in a running Fever, the engine's rule held; returns the harness. */
+  const fevered = () => {
+    const { h, u } = field({ skill: 0 });
     const rule = hold(u);
     chargeGauge(h, u, h.enemies()[0]);
-    u.skill.charges = 0;
-    u.skill.sp = 0;
     release(u, rule);
-    u.skill.gainSp(sp);
-    const cast = untilCast(h, u, 10);
-    assert.ok(cast, 'the engine released it');
-    assert.notEqual(cast.reason, 'manual');
-    done(h);
-    return { u, cast };
+    u.skill.gainSp(9999);
+    assert.equal(u.skill.activate('manual'), true, 'a cast at a full gauge (the gauge itself is spent by the state)');
+    assert.ok(u.mem.sakikoFeverLeft > 0, 'in Fever');
+    assert.equal(u.skill.rule, 'NEVER', '常规自动发动 is suspended for the window');
+    return { h, u, rule };
   };
-  const full = autoRelease(9999);
-  assert.equal(full.u.skill.sakikoChargeFull, true, 'this release started from a full charge (2/2)');
-  assert.equal(full.u.mem.sakikoFeverLeft, 0, '充能满自动释放: no Fever');
-  const one = autoRelease(full.u.skill.spCost);
-  assert.equal(one.u.skill.sakikoChargeFull, false, 'this one did not');
-  assert.ok(one.u.mem.sakikoFeverLeft > 0, 'a plain automatic cast at a full gauge does trigger it');
+  const paths = {
+    '到时间': () => {},
+    '她在 Fever 中被退场': (h, u) => h.b.retreat(u, { reason: 'retreat' }),
+    '她被击倒（免死 → 强制退场）': (h, u) => h.b.dealDamage(null, u, { amount: 1e9, type: 'true' }),
+    '她在 Fever 中被再部署': (h, u) => { h.b.retreat(u, { reason: 'retreat' }); assert.equal(h.b.redeploy(u, { free: true }), true, 'redeployed'); },
+    '她在 Fever 中被永久退场': (h, u) => h.b.retreat(u, { reason: 'expired', permanent: true }),
+  };
+  for (const [name, act] of Object.entries(paths)) {
+    const { h, u, rule } = fevered();
+    act(h, u);
+    h.run(FEVER_SEC + 1);
+    assert.equal(u.mem.sakikoFeverLeft, 0, `${name}: the window is over`);
+    assert.equal(u.findBuff('sakiko:fever'), null, `${name}: the marker is gone`);
+    assert.equal(u.skill.rule, rule, `${name}: 常规自动发动 is restored`);
+    done(h);
+  }
+  // the one path that cannot restore it in place: the battle ends inside the window. The next battle is a new Battle with
+  // its own skill runtimes (the state is keyed `Battle × ownerId`), so nothing is carried over.
+  const { h, u } = fevered();
+  h.b.forceEnd('cleared');
+  const { h: h2, u: u2 } = field({ skill: 0, timeLimit: 60, autoFinish: false });
+  h2.run(5);
+  assert.equal(u2.skill.rule, 'DEFAULT', 'a new battle starts with the data\'s own rule');
+  assert.equal(u.skill.rule, 'NEVER', 'the finished battle keeps its own (no step will run again)');
+  u.skill.rule = 'DEFAULT';   // leave the finished battle tidy for the invariant check below
+  done(h); done(h2);
+  // …and a member that leaves the field inside the window is released with the rest (two copies of her)
+  const { h: h3, u: a } = field({ skill: 0, others: [{ uid: 2, diy: { slot: SLOT[5], charId: CHAR, skillIndex: 0 }, row: 11, col: 4 }] });
+  const b2 = h3.unit(2);
+  const r2 = hold(a);
+  chargeGauge(h3, a, h3.enemies()[0]);
+  release(a, r2);
+  a.skill.gainSp(9999);
+  a.skill.activate('manual');
+  assert.ok(b2.mem.sakikoFeverLeft > 0, 'both copies are in');
+  h3.b.retreat(b2, { reason: 'retreat' });
+  h3.run(FEVER_SEC + 1);
+  assert.equal(a.skill.rule, 'DEFAULT', 'the copy on the field is released');
+  assert.equal(b2.skill.rule, 'DEFAULT', 'and so is the one that left');
+  done(h3);
 });
 
 test('S2 是切换类技能: Fever 期间无法开启，可以触发 Fever 时只触发 Fever、不切换形态', () => {

@@ -330,6 +330,10 @@ export async function createFieldView(host, options = {}) {
     // visual of its own (kits/ops/op-oblvns.js `noAttackVis`). Unknown defs keep the slash.
     rangedOf: (defId, info = null) => (((info && info.standInFor && data.standIn(defId)) || (info && info.diy && data.diy(defId, info.diy)) || data.chess(defId))?.attackKind === 'ranged'),
     view: (id) => views.get(id) || null,
+    // every view of the field, for the one lookup that goes by POSITION: a note is born at its caster, and the launch
+    // sound's limiter key wants to know which unit that was (render/fx/notes.js `_noteOwner` — two 丰川祥子 must each
+    // be heard). Presentation only: the positions are the sim's own.
+    units: () => views,
     screenSize: size,
     fieldTop: () => {
       const R = camRect();
