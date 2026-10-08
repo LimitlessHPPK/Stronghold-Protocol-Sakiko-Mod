@@ -21,7 +21,8 @@
 //      switch skill (S2) excluded; a sustained skill that ran when Fever started has its clock frozen and gets it back
 //      when Fever ends; a sustained skill Fever opened is ended with it; S1's charge-cap auto release — the cap's own
 //      extra effect (`chargeCapRelease`: 「可充能2次，充能至最大层数时自动释放一次」), which the engine's trigger rules
-//      do NOT provide — does not trigger Fever (§17), while every other activation does (§16).
+//      do NOT provide — triggers Fever like any other activation (§16, the owner's ruling of 2026-10-08; §17's
+//      「因充能到达上限自动释放时，不会触发 Fever」 is about the official's MANUAL press and does not apply here).
 //    * The notes: one note per attack (talent 1 「攻击会演奏追踪敌人的音符」), the damage of a note is
 //      `ATK × profile.dmgMul` snapshotted at LAUNCH (PRTS 「所有音符强制使用缓存攻击力与攻击倍率」), the talent's
 //      DEF / RES penetration per note in flight («每存在一个音符…3% 防御力和 2% 法术抗性（最多 10 层）») written with
@@ -252,10 +253,10 @@ function feverCast(battle, unit, st) {
 }
 
 /**
- * The activation reason of the CAP RELEASE below. §17 S1's one exception is written against it: 「因充能到达上限自动释放
- * 时，不会触发 Fever」 — the release the charge cap itself causes is the only activation Fever leaves out; every other one
- * (the mode's own automatic cast, a manual press, a kit's activate) counts (「本模式是全自动放技能：任意一次技能发动
- * （含自动）在蓄满时即可触发」, §16).
+ * The activation reason of the CAP RELEASE below, so that the release can be told apart from the engine's own automatic
+ * cast (`DEFAULT`) and from a manual press in a log or a test. It is NOT a Fever exception: PRTS §17's 「因充能到达上限
+ * 自动释放时，不会触发 Fever」 is written against the official's MANUAL press, and this mode casts automatically (the
+ * owner's ruling of 2026-10-08), so a cap release at a full gauge triggers Fever like every other activation (§16).
  */
 const CHARGE_FULL = 'chargeFull';
 
@@ -874,7 +875,7 @@ export default {
 
           // S2 is her 切换类技能, and §16/§17 give it three rules that all have to be decided BEFORE the switch happens
           // — so the runtime's own `activate` is guarded (non-enumerable: never serialised). Every activation path goes
-          // through it, the engine's own automatic cast included (「自动释放始终不改变技能为手动触发的本质」).
+          // through it, the engine's own automatic cast (`DEFAULT`) included.
           //   * 「Fever 期间，此技能无法手动开启」                              → refused while the state runs
           //   * 「可以触发 Fever 时，触发技能将仅触发 Fever，不进行技能形态切换」  → a full gauge turns the cast into Fever
           //   * Fever never opens it either («切换类技能除外», feverCast skips it)
@@ -884,8 +885,9 @@ export default {
           // the SP that reaches the cap can arrive in either half of a step and the release has to beat the engine's own
           // cast to it: the `tick` hook (after the projectiles — where one of her notes LANDING pays her attack SP) fires
           // it the moment the cap is reached, and the member timer below runs before the allies phase of the next step,
-          // so the operation can never cast at the cap first (that cast would be an operation's, and §17's exception is
-          // about the CAP's own release — see the skillStart handler below).
+          // so the operation can never cast at the cap first (that cast would be an operation's, and the two are told
+          // apart by their reason — `chargeFull` vs the engine's own `DEFAULT`; both trigger Fever alike since the
+          // owner's ruling of 2026-10-08, see the skillStart handler below).
           if (ownSkill && ownSkill.kind === 'charges' && ownSkill.maxCharges > 1) {
             battle.on('tick', () => { chargeCapRelease(battle, unit); }, { owner: unit });
           }
@@ -1012,18 +1014,20 @@ export default {
 
           // Fever is triggered by a skill activation made while the TEAM gauge is FULL (「Fever累计至450点时，任意一位 Ave
           // Mujica 成员手动触发技能后」 — and this mode casts skills automatically, so ANY activation counts, not only a
-          // manual press; §17's one exception is S1's cap release below). Whoever casts it, every member of that player enters.
+          // manual press). Whoever casts it, every member of that player enters.
+          //
+          // NO EXCEPTION for S1's cap release (the owner's ruling of 2026-10-08). PRTS §17 says 「因充能到达上限自动释放
+          // 时，不会触发 Fever。不论是因 Fever 还是因满充能，自动释放始终不改变技能为手动触发的本质」 — and that wording
+          // is a statement about the OFFICIAL's MANUAL press: 「自动释放始终不改变技能为手动触发的本质」 only excludes the
+          // cap release because the activation it belongs to is a manual one. In THIS mode the skill is cast AUTOMATICALLY
+          // — 「这个模式是自动触发，也就是说系统帮你按了技能键」 — so the premise the exception rests on does not hold:
+          // every activation counts, the cap's own release included. The old charge-STATE test could not tell 「the cap
+          // released it」 from 「the operation pressed while the charges happened to be full」 either, and at any real 攻速
+          // (4 attacks per charge faster than the operation's 3 s cooldown, i.e. an attack interval under 0.75 s /
+          // ASPD ≳ 173 — her own talent aura +16 and module +12 plus one 攻速 item already cross it) it swallowed EVERY
+          // release and left S1 unable to trigger Fever at all — see 12-sakiko.md §16/§17.
           battle.on('skillStart', (ctx) => {
             if (ctx.unit !== unit || ctx.reason === 'fever') return;   // Fever's own releases never re-trigger it
-            // §17 S1: 「因充能到达上限自动释放时，不会触发 Fever。不论是因 Fever 还是因满充能，自动释放始终不改变技能为
-            // 手动触发的本质」 — the release the charge cap ITSELF causes (chargeCapRelease) is the one activation that stays
-            // out. Everything else counts, the engine's own automatic cast (this mode's 自动作战, the stand-in for the
-            // manual press the official 备注 asks for) and a manual press alike: the old charge-STATE test could not tell
-            // 「the cap released it」 from 「the operation pressed while the charges happened to be full」, and at any real
-            // 攻速 (4 attacks per charge faster than the operation's 3 s cooldown, i.e. an attack interval under 0.75 s /
-            // ASPD ≳ 173 — her own talent aura +16 and module +12 plus one 攻速 item already cross it) that swallowed EVERY
-            // release and left S1 unable to trigger Fever at all — see 12-sakiko.md §16/§17.
-            if (ctx.reason === CHARGE_FULL) return;
             if (feverState(battle, unit).gauge < FEVER_MAX) return;    // 蓄满（450）才可触发
             enterFever(battle, unit);
           }, { owner: unit });

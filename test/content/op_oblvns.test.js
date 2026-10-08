@@ -941,7 +941,7 @@ test('蓄满（450）时任意一次技能发动触发 Fever: 全员进入 20 �
   done(h);
 });
 
-test('S1 「充能至最大层数时自动释放一次」: 攻击范围内没有敌人也释放（SP 满了不再干等普攻），这一次不触发 Fever (§17)', () => {
+test('S1 「充能至最大层数时自动释放一次」: 攻击范围内没有敌人也释放（SP 满了不再干等普攻），蓄满时这一次也触发 Fever（裁定 2026-10-08）', () => {
   // PRTS 技能 §特殊属性 / 可充能:「部分可充能技能在技力达到上限后（即充能次数达到上限）会立刻产生额外效果，如立刻释放
   // 一次」 — the cap release is the skill's own EXTRA EFFECT, not a trigger rule: the engine's DEFAULT rule needs an enemy
   // inside her INITIAL range at attack time, and none of its rules fires with an empty range. Her 持续攻击 still plays
@@ -967,8 +967,11 @@ test('S1 「充能至最大层数时自动释放一次」: 攻击范围内没有
   assert.equal(u.mem.sakikoFeverLeft, 0, 'the gauge was never full here');
   done(h);
 
-  // §17 in its own right: a cap release at a FULL gauge does NOT trigger Fever (「因充能到达上限自动释放时，不会触发
-  // Fever」), while every other activation does — the next test.
+  // A cap release at a FULL gauge DOES trigger Fever — the owner's ruling of 2026-10-08. PRTS §17 says 「因充能到达上限
+  // 自动释放时，不会触发 Fever。不论是因 Fever 还是因满充能，自动释放始终不改变技能为手动触发的本质」, and that wording
+  // is written against the OFFICIAL's MANUAL press: the exception is a consequence of 「手动触发的本质」. In THIS mode the
+  // skill is cast AUTOMATICALLY — 「这个模式是自动触发，也就是说系统帮你按了技能键，所以应该要触发」 — so the premise the
+  // exception rests on does not hold and the exception is gone. Every activation counts now, this one included (§16).
   const g = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 9] }] });
   const sk2 = g.u.skill;
   assert.equal(sk2.rule, 'DEFAULT', 'the engine\'s own cast is not held here');
@@ -980,9 +983,50 @@ test('S1 「充能至最大层数时自动释放一次」: 攻击范围内没有
   const cast = castsOf(g.h, g.u).slice(n0)[0];
   assert.ok(cast, 'the cap released it');
   assert.equal(cast.reason, 'chargeFull', 'again the cap release');
-  assert.equal(g.u.mem.sakikoFeverLeft, 0, '§17: 因充能到达上限自动释放时，不会触发 Fever');
-  assert.equal(g.u.findBuff('sakiko:fever'), null, 'and no marker');
+  assert.ok(g.u.mem.sakikoFeverLeft > 0, '裁定 2026-10-08: 充能满这一次也算技能发动 → 蓄满即触发 Fever');
+  assert.ok(g.u.findBuff('sakiko:fever'), 'and the marker is on her');
+  assert.equal(g.u.mem.sakikoFever, 0, '「耗尽」: the state spends the gauge it was paid with');
   done(g.h);
+});
+
+test('边界: 已经在 Fever 里时充能满不再发动、也不重复进入（计量不累积、窗口不重置）', () => {
+  // The other half of the ruling. The cap release counts as a 技能发动 for the GAUGE test, but Fever's own rules still
+  // rule the window: 「Fever 状态期间：耗尽且不累积 Fever 值」, and «Fever 期间，此技能将被持续地触发» — the state's free
+  // releases are the ones firing, which is `chargeCapRelease`'s own `left > 0` guard. So a cap that sits FULL inside the
+  // window neither casts nor re-enters. The re-entry matters because `enterFever` is idempotent-REFRESHING: a second call
+  // inside the window would put `st.left` back to FEVER_SEC and silently extend it (it would not spend the gauge twice —
+  // `fresh` is false — but the window would never be the 20 s §16 promises).
+  const { h, u } = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 9] }] });
+  const sk = u.skill;
+  chargeGauge(h, u, h.enemies()[0]);
+  assert.equal(u.mem.sakikoFever, FEVER_MAX, 'the gauge is full');
+  const n0 = castsOf(h, u).length;
+  h.runUntil(() => castsOf(h, u).length > n0, 30);            // the cap release → Fever (the ruling above)
+  const cast = castsOf(h, u)[n0];
+  assert.equal(cast.reason, 'chargeFull', 'in through the cap release, as the ruling has it');
+  assert.ok(u.mem.sakikoFeverLeft > 0, 'Fever is running');
+  const t0 = h.b.time, entry = u.mem.sakikoFeverLeft;
+  assert.equal(sk.rule, 'NEVER', '常规自动发动 is held for the window');
+  sk.charges = sk.maxCharges;                                  // the cap is FULL inside the window: the very state that
+                                                              // releases the skill outside it
+  let prev = u.mem.sakikoFeverLeft, bumped = 0, sawFreeRelease = false;
+  for (let i = 0; i < 30 * (FEVER_SEC + 3) && u.mem.sakikoFeverLeft > 0; i++) {
+    const seen = castsOf(h, u).length;
+    h.step(1);
+    if (castsOf(h, u).length > seen && castsOf(h, u)[seen].reason === 'fever') sawFreeRelease = true;
+    if (u.mem.sakikoFeverLeft > prev) bumped++;                 // a re-entry would jump it back to FEVER_SEC
+    prev = u.mem.sakikoFeverLeft;
+  }
+  // the window was genuinely running (its own free releases fired), so the assertions below are about Fever, not silence
+  assert.ok(sawFreeRelease, '「无视技力限制地持续尝试开启技能」: Fever released her skill for free inside the window');
+  assert.ok(Math.abs((h.b.time - t0) - FEVER_SEC) < 0.2, `one single ${FEVER_SEC} s window (${(h.b.time - t0).toFixed(2)} s)`);
+  assert.equal(bumped, 0, `the countdown never went back up (a re-entry would refresh it to ${entry} s)`);
+  assert.equal(castsOf(h, u).filter((c) => c.reason === 'chargeFull' && c.t > t0 && c.t < t0 + FEVER_SEC - 0.05).length, 0,
+    'the cap never released inside Fever («Fever 期间，此技能将被持续地触发»)');
+  assert.equal(u.mem.sakikoFever, 0, '「耗尽且不累积 Fever 值」: the gauge never fills inside the window');
+  assert.equal(u.mem.sakikoFeverLeft, 0, 'the window ends on schedule');
+  assert.equal(u.findBuff('sakiko:fever'), null, 'and the marker is gone');
+  done(h);
 });
 
 test('S1 的常规自动发动（自动作战）在蓄满时触发 Fever —— 攻速堆到 4 次攻击充满一层、技能停在满充能上也一样 (§16/§17)', () => {
