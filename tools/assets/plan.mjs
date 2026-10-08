@@ -23,7 +23,7 @@
 
 import { RAW, joinUrl, safeName, urlBase, urlDir } from './sources.mjs';
 import { kindOf } from './formats.mjs';
-import { pickUnitSfx, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS } from './audio.mjs';
+import { pickUnitSfx, unitSfxBanks, UI_SFX, BATTLE_SFX, resolveSpec, indexVoice, VOICE_DIRS, VOICE_BATTLE_SLOTS } from './audio.mjs';
 import { literal } from './manifest.mjs';
 import { EMOTE_CATALOG } from '../../shared/constants.js';
 
@@ -400,8 +400,26 @@ export function buildPlan({ assets07, ops03, enemies05, maps05, audio, modelsDat
     // skill icons (+ skill SFX) of every skill index; normal-mode attack / impact sounds only (a ranged operator's own
     // projectile banks projectile_chr_<name> as fallbacks — user playtest #4 item 6, audio.mjs pickUnitSfx)
     const short = id.replace(/^char_\d+_/, '');
-    const sfx = pickUnitSfx(audio.unitBanks.get(id), { operator: true, projectile: {
-      born: audio.bank(`battle.ON_PROJECTILE_BORN.projectile_chr_${short}`), hit: audio.bank(`battle.ON_PROJECTILE_HIT.projectile_chr_${short}`) } });
+    // The 自选 (diy) picks are ordinary operators here — extraOps joins this very loop above, so 丰川祥子 reaches
+    // pickUnitSfx exactly like a pool operator. Her two roles are nonetheless PINNED explicitly (audio.mjs
+    // UNIT_SFX_BANKS / unitSfxBanks) on top of the conventional pick, because the convention resolves her `attack`
+    // through a name-luck rather than a rule (the table's comment has the whole chain). The pin's values are the ones
+    // the convention produces today — the files the 0.1.4 tree's manifest carried — so this is insurance, not a change.
+    //
+    // Port regression this repairs (0.1.4 → 0.2.x, owner report 「祥子攻击敌人，敌人受击没有音效」/「发出音符也没声音」):
+    // her `attack` / `hit` were never unresolvable — 0.1.4's audio.mjs resolves them with this same code. What changed
+    // is the ASSETS. In 0.1.4 she was a normal chess, so a full `npm run assets` downloaded her two files with the rest
+    // of the pool. In 0.2.x she arrives as a 自选 pick into a public/assets folder that is SHARED between checkouts and
+    // already held thousands of files, and the port's manifest rebuilds ran `--offline --add-only` (which never
+    // downloads a file that is not there yet) plus `tools/fetch-voice-override.mjs --sfx` for her skill-activation
+    // banks. Those are exactly the three sounds that survived. `manifest.mjs resolveTemplate` then drops a leaf whose
+    // files are missing on disk — silently, in a list of hundreds of legitimate misses (`requiredMisses` only checks
+    // avatar / portrait / spine.front per char) — so a role the plan HAD resolved simply vanished from the manifest.
+    // Fix: the two files on disk (lower-case, the manifest's own path) + this pin + test/sfx-oblvns.test.js pinning the
+    // manifest, the disk and the client end.
+    const sfx = { ...pickUnitSfx(audio.unitBanks.get(id), { operator: true, projectile: {
+      born: audio.bank(`battle.ON_PROJECTILE_BORN.projectile_chr_${short}`), hit: audio.bank(`battle.ON_PROJECTILE_HIT.projectile_chr_${short}`) } }),
+      ...unitSfxBanks(audio, id) };
     const { roles: u, mix } = unitSounds(audio, sfx);
     const skillSfx = {};
     for (const i of idx) {

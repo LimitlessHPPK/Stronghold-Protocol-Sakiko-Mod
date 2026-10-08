@@ -1,7 +1,8 @@
-// test/sfx-oblvns.test.js — 丰川祥子's skill activation sounds: "放大招没音效" (user report).
+// test/sfx-oblvns.test.js — 丰川祥子's battle SFX: her skill-activation sounds ("放大招没音效") AND her ordinary
+// attack / impact sounds ("祥子攻击敌人，敌人受击没有音效", "发出音符也没有声音" — owner reports).
 //
-// Her 普攻 sounds were in the manifest from the start (die / born), but `sfx.units[char_4182_oblvns]` carried NO
-// `skills[]` at all, and the client plays a unit's skill sound only from there (`public/js/audio.js unit`:
+// 1. Skill sounds. Her 普攻 sounds were in the manifest from the start (die / born), but `sfx.units[char_4182_oblvns]`
+// carried NO `skills[]` at all, and the client plays a unit's skill sound only from there (`public/js/audio.js unit`:
 // `u.skills[skillIndex]`, on the sim's own 'skill' event — no client change is involved). The reason is not the
 // manifest but the resolution behind it: `tools/assets/plan.mjs` read the official `battle.ON_SKILL_START.<skillId>`
 // bank, and not one of her three skills has a bank named that way:
@@ -16,18 +17,36 @@
 // conventional bank, and it cannot touch another operator), the resolver, the fetcher's job derivation, and the
 // manifest / disk / client end.
 //
+// 2. Attack / impact — a PORT REGRESSION of 0.1.4, restored by this file's second half. 0.1.4's `data/assets.json`
+// carried
+//   "attack": "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdslnt.mp3",
+//   "hit":    "/assets/audio/sfx/player/p_imp/p_imp_mjckyrdnt.mp3",
+// and 0.2.x shipped neither, so the note she fires left her silently and its impact on the enemy was silent too.
+// What was NOT lost is the resolution: `plan.mjs` resolves both roles for a 自选 (diy) pick exactly like for a pool
+// operator — `extraOperators` joins the same loop (`for (const id of charIds)`), and the real `buildPlan` template
+// carries the two files 0.1.4 shipped. What was lost is the two FILES. In 0.1.4 she was a normal chess, so a full
+// `npm run assets` downloaded them with the rest of the pool. The 0.2.x port brings her in as a 自选 pick into a
+// public/assets folder that is shared with other checkouts and already held thousands of files, and its rebuilds ran
+// `--offline --add-only` (which never downloads a file that is not on disk yet) plus
+// `tools/fetch-voice-override.mjs --sfx` for her three skill banks — which are exactly the sounds that survived.
+// `tools/assets/manifest.mjs resolveTemplate` drops a leaf whose alternatives are missing on disk, silently, inside a
+// list of hundreds of legitimate misses (`requiredMisses` checks avatar / portrait / spine.front only), so a role the
+// plan HAD resolved disappeared from the manifest together with its file. The repair: the two files on disk in the
+// manifest's own (lower-case) spelling, the explicit `UNIT_SFX_BANKS` pin in audio.mjs, and the assertions below.
+//
 // The data half is skipped when the git-ignored pieces are absent (`.cache/gamedata/excel/audio_data.json`,
 // `public/assets/**`); the committed `data/assets.json` half always runs.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SKILL_START_BANKS, indexAudio } from '../tools/assets/audio.mjs';
+import { SKILL_START_BANKS, UNIT_SFX_BANKS, indexAudio, pickUnitSfx, unitSfxBanks } from '../tools/assets/audio.mjs';
 import { SOUND_ALTS, soundAlt } from '../tools/assets/plan.mjs';
 import { isMp3 } from '../tools/assets/formats.mjs';
 import { parseArgs, planSkills, sfxJobs } from '../tools/fetch-voice-override.mjs';
+import { AudioManager, normalAttackSfx } from '../public/js/audio.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = join(ROOT, 'public');
@@ -38,6 +57,11 @@ const EXPECTED = {
   skchr_oblvns_1: { index: 0, bank: 'battle.ON_ABILITY_START.skchr_oblvns_1', files: ['player/p_skill/p_skill_mjckyrdglsnt_d1.mp3'] },
   skchr_oblvns_2: { index: 1, bank: 'battle.ON_SKILL_START.skchr_oblvns_2.1', files: ['player/p_skill/p_skill_mjckyrdslnt_h2.mp3'] },
   skchr_oblvns_3: { index: 2, bank: 'battle.ON_CUSTOM_TRIGGER.skchr_oblvns_3[start]', files: ['player/p_skill/p_skill_mjckyrdslnt_s1.mp3'] },
+};
+/** The two unit sounds 0.1.4's manifest carried, verbatim (its `audio.sfx.units.char_4182_oblvns`). */
+const V014 = {
+  attack: '/assets/audio/sfx/player/p_atk/p_atk_mjckyrdslnt.mp3',
+  hit: '/assets/audio/sfx/player/p_imp/p_imp_mjckyrdnt.mp3',
 };
 
 const readJson = (rel) => JSON.parse(readFileSync(join(ROOT, rel), 'utf8'));
@@ -99,6 +123,55 @@ describe('SKILL_START_BANKS (audio.mjs): the banks the ON_SKILL_START convention
       { name: SKILL_START_BANKS.skchr_oblvns_2[1], sounds: [{ asset: 'Audio/Sound_Beta_2/P/one' }] },
     ] });
     assert.deepEqual(dup.skillStart('skchr_oblvns_2'), ['p/one.mp3']);
+  });
+});
+
+describe('UNIT_SFX_BANKS (audio.mjs): the two unit sounds the port lost, pinned to 0.1.4', () => {
+  const assetUrl = (p) => `/assets/audio/sfx/${p}`;
+
+  test('her attack / hit resolve to the 0.1.4 files, from the banks the table names', { skip: noAudio }, () => {
+    assert.deepEqual(Object.keys(UNIT_SFX_BANKS), [CHAR], 'the table names her and nobody else');
+    assert.deepEqual(unitSfxBanks(audio, CHAR), {
+      attack: ['player/p_atk/p_atk_mjckyrdslnt.mp3'],
+      hit: ['player/p_imp/p_imp_mjckyrdnt.mp3'],
+    }, 'the paths behind 0.1.4\'s two manifest URLs');
+    for (const [role, names] of Object.entries(UNIT_SFX_BANKS[CHAR])) {
+      assert.ok(names.length >= 1, `${role}: at least one bank`);
+      for (const name of names) assert.ok(audio.bank(name).length, `${role}: ${name} carries sounds`);
+      assert.deepEqual([...new Set(names.flatMap((n) => audio.bank(n)))], Object.values(unitSfxBanks(audio, CHAR)[role]),
+        `${role}: bank order, deduped`);
+    }
+    assert.equal(unitSfxBanks(audio, 'char_000_nobody'), null, 'an unlisted unit has no pinned role');
+  });
+
+  test('the `attack` file has exactly ONE bank in the whole official index — the one the table names', { skip: noAudio }, () => {
+    // The provenance the table documents: her default-mode banks carry the other take (`…_h`), so the file 0.1.4 played
+    // and today's convention picks can only come from this one bank.
+    const hits = audioData.soundFXBanks
+      .filter((b) => (b.sounds || []).some((s) => /\/p_atk_MJCkyrdslnt$/i.test(String(s.asset))))
+      .map((b) => b.name);
+    assert.deepEqual(hits, [...UNIT_SFX_BANKS[CHAR].attack]);
+  });
+
+  test('the pin agrees with the convention it replaces, and only the client-accepted take is used', { skip: noAudio }, () => {
+    // plan.mjs's own call for her (the projectile banks are named after the char's short id there): the pinned roles
+    // must be exactly what the convention resolves today — the pin is insurance against the name-luck, not a change.
+    const short = CHAR.replace(/^char_\d+_/, '');
+    const conventional = pickUnitSfx(audio.unitBanks.get(CHAR), { operator: true, projectile: {
+      born: audio.bank(`battle.ON_PROJECTILE_BORN.projectile_chr_${short}`),
+      hit: audio.bank(`battle.ON_PROJECTILE_HIT.projectile_chr_${short}`) } });
+    const pinned = unitSfxBanks(audio, CHAR);
+    for (const role of Object.keys(pinned)) assert.deepEqual(pinned[role], conventional[role], `${role}: the convention already agrees`);
+    // and the take that route must NOT drift to: her default-mode bank (`ON_ABILITY_ON.<char>.attack.0.1` / `combat.0`)
+    // ends in `_h`, which the client refuses for a normal attack — a manifest pointing there would be silence.
+    assert.equal(normalAttackSfx(CHAR, assetUrl('player/p_atk/p_atk_mjckyrdnt_h.mp3')), false, 'the _h take is refused');
+    for (const role of ['attack', 'hit']) assert.equal(normalAttackSfx(CHAR, assetUrl(pinned[role][0])), true, `${role} is played`);
+  });
+
+  test('no other unit of the plan can be affected by the table', { skip: noAudio }, () => {
+    assert.ok(skills.size > 100, `${skills.size} operators in the plan`);
+    const named = [...skills.keys()].filter((id) => unitSfxBanks(audio, id));
+    assert.deepEqual(named, [CHAR], 'only her');
   });
 });
 
@@ -191,6 +264,19 @@ describe('the manifest, the files on disk and the client', () => {
     assert.ok(Object.values(u.skills).includes(u.skill), 'the fallback is one of the three cues');
   });
 
+  test('her entry carries the 0.1.4 attack / hit sounds — the port regression this file exists for', { skip: noManifest }, () => {
+    const u = her();
+    assert.equal(u.attack, V014.attack);
+    assert.equal(u.hit, V014.hit);
+    assert.deepEqual(Object.keys(u).sort(), ['attack', 'born', 'die', 'hit', 'skill', 'skills'],
+      'the four unit roles + the skill cues, and nothing else (no invented slot: see UNIT_SFX_BANKS)');
+    // the manifest's own numbers: her fix added two FILES, not a unit, and no other unit lost its entry
+    assert.equal(manifest.stats.sfxUnits, Object.keys(manifest.audio.sfx.units).length);
+    assert.ok(manifest.stats.files >= 8001, `${manifest.stats.files} files listed`);
+    // both roles are played by the client for a NORMAL attack (the _d / _h / _s filter would refuse a skill take)
+    for (const role of ['attack', 'hit']) assert.equal(normalAttackSfx(CHAR, u[role]), true, role);
+  });
+
   test('every one of those URLs is an mp3 on disk', { skip: noAssets }, () => {
     for (const url of Object.values(her().skills).concat(her().skill)) {
       const file = join(PUBLIC, url.replace(/^\/assets\//, 'assets/'));
@@ -199,8 +285,23 @@ describe('the manifest, the files on disk and the client', () => {
     }
   });
 
-  test('the client plays the equipped skill\'s own cue (audio.js unit → u.skills[skillIndex])', { skip: noManifest }, async () => {
-    const { AudioManager } = await import('../public/js/audio.js');
+  test('every one of her files is on disk in exactly the case the manifest spells', { skip: noAssets }, () => {
+    const u = her();
+    // Windows resolves any case, a Linux server does not: the DIRECTORY LISTING (not existsSync) is what proves the
+    // name. The seven skill files were on disk as `p_skill_MJC….mp3` while the manifest said `…_mjc…` — the official
+    // audio_data `asset` strings carry that case, the dump's file NAMES do not (`fetch-assets` lower-cases both), so the
+    // mismatch was invisible on Windows and a 404 on Linux.
+    const urls = [...new Set([u.attack, u.hit, u.die, u.born, u.skill, ...Object.values(u.skills)])];
+    assert.equal(urls.length, 7, 'her four unit roles + the three skill cues (the `skill` fallback is one of them)');
+    for (const url of urls) {
+      const file = join(PUBLIC, url.replace(/^\/assets\//, 'assets/'));
+      assert.ok(existsSync(file), `${url} is on disk`);
+      assert.ok(readdirSync(dirname(file)).includes(basename(file)), `${url}: exact name on disk (a case-only mismatch is a 404 on Linux)`);
+      assert.ok(isMp3(readFileSync(file)), `${url} is an MP3`);
+    }
+  });
+
+  test('the client plays the equipped skill\'s own cue (audio.js unit → u.skills[skillIndex])', { skip: noManifest }, () => {
     const a = new AudioManager({ win: null, getManifest: () => manifest });
     a.ctx = {};
     const played = [];
@@ -210,6 +311,35 @@ describe('the manifest, the files on disk and the client', () => {
     // a unit without a skillIndex still gets her S1 cue through the `skill` fallback the manifest carries
     assert.equal(a.unit(CHAR, 'skill', 2, undefined), true);
     assert.equal(played[3], her().skill);
+  });
+
+  test('one ordinary attack: her attack cue (vis "none") and its note\'s impact, from the real event stream', { skip: noManifest }, () => {
+    // The exact tuples the sim emits for her (measured against a real battle, `makeBattle` with her 自选 slot): the
+    // 'atk' of a normal attack carries vis 'none' — the kit's `noAttackVis`, ai.js — and her talent note lands
+    // 900–933 ms later as `['dmg', 2, n, 'arts']`. Both sides matter: the 'atk' registers her as the target's attacker
+    // (the client still plays a unit's `attack` cue for a vis-less attack), and the 'dmg' within IMPACT_WINDOW_MS
+    // (2500) plays HER `hit` — which is the sound the owner reported missing.
+    const a = new AudioManager({ win: null, getManifest: () => manifest });
+    a.ctx = {};
+    const played = [];
+    a._play = (url) => { played.push(url); };
+    a.setFieldUnits([{ id: 1, side: 'ally', kind: 'chess', spine: CHAR }, { id: 2, side: 'enemy', kind: 'enemy', spine: 'enemy_1007_slime' }]);
+    const perf = globalThis.performance;
+    let now = 1000;
+    globalThis.performance = { now: () => now };
+    try {
+      a.handleBattleEvents([['atk', 1, 2, 'none']]);
+      assert.deepEqual(played, [her().attack], '发出音符: the swing/launch cue, even with vis "none"');
+      now += 900;
+      a.handleBattleEvents([['dmg', 2, 490, 'arts']]);
+      assert.deepEqual(played, [her().attack, her().hit], '命中: her note\'s impact on the enemy');
+      // an impact outside the window is another attack's (or none): no second hit cue
+      played.length = 0;
+      a.handleBattleEvents([['atk', 1, 2, 'none']]);
+      now += 2600;
+      a.handleBattleEvents([['dmg', 2, 490, 'arts']]);
+      assert.deepEqual(played, [her().attack], '2500 ms window');
+    } finally { globalThis.performance = perf; }
   });
 });
 

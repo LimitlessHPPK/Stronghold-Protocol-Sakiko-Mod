@@ -96,6 +96,67 @@ her Chinese lines are missing (see above) and so were her skill sounds. Fetch th
 `node tools/fetch-voice-override.mjs --sfx` (same proxy policy as her voice; `--char=<charId>` reports, per skill, which
 ones have no matching official bank instead of writing nothing silently).
 
+### 普攻 / 命中音效（`sfx.units[charId].attack` / `.hit`）: 0.1.4 有 → 0.2.x 丢 → 现在恢复
+
+The client plays a unit's `attack` on every `['atk', attacker, target, kind]` aimed at the other side and its `hit` on
+the first `['dmg', target, …]` of `phys` / `arts` / `true` that follows within 2.5 s (`public/js/audio.js
+handleBattleEvents`, `IMPACT_WINDOW_MS`). 丰川祥子's ordinary attack is a note her kit adds and the engine's own arrow
+carries nothing (`ai.js noAttackVis` / `noAttackDamage`), so the attack event's `vis` is `'none'` — the client plays the
+`attack` cue anyway (only the *drawing* reads `vis`), and the note's landing is the `dmg` that plays her `hit`.
+
+**This is a port regression of 0.1.4, not a missing feature.** 0.1.4's manifest carried
+
+```json
+"attack": "/assets/audio/sfx/player/p_atk/p_atk_mjckyrdslnt.mp3",
+"hit":    "/assets/audio/sfx/player/p_imp/p_imp_mjckyrdnt.mp3"
+```
+
+and 0.2.x shipped neither, so the note left her silently and its impact on the enemy was silent too. What was NOT lost
+is the resolution: `plan.mjs` resolves both roles for a 自选 (diy) pick exactly like for a pool operator — the 自选 owned
+picks join `extraOperators`, which is merged into the very loop that calls `pickUnitSfx`, and running the real
+`buildPlan` on this tree's data produces a template whose leaves are the two files above. What was lost is the two
+**files**. In 0.1.4 she was a normal chess, so a full `npm run assets` downloaded them with the rest of the pool. The
+0.2.x port brings her in as a 自选 pick into a `public/assets` folder that is **shared between checkouts** and already
+held thousands of files, and its manifest rebuilds ran `--offline --add-only` (which never downloads a file that is not
+on disk yet) plus `tools/fetch-voice-override.mjs --sfx` for her three skill banks — which are exactly the sounds that
+survived. (A plain `tools/fetch-assets.mjs` on this machine cannot reach the voice branch at all without the proxy —
+see "An operator whose dub does not exist upstream" above — so nothing else was going to arrive for her either; a
+`--asset-source=mirror` run or that script is what a new 自选 operator needs.) `manifest.mjs resolveTemplate` drops a
+leaf whose alternatives are missing on disk, **silently**, among hundreds of legitimate misses (`fetch-assets.mjs
+requiredMisses` checks `avatar` / `portrait` / `spine.front` only), so a role the plan HAD resolved disappeared from the
+manifest together with its file. A new operator on the 自选 route therefore needs a run that actually downloads
+(`node tools/fetch-assets.mjs --asset-source=mirror`, or `node tools/fetch-voice-override.mjs --sfx` for the activation
+banks), not a rebuild of what is already there — and `audio.mjs UNIT_SFX_BANKS` now names her two roles outright so they
+cannot drift again.
+
+The official bank shapes, and why the table names them instead of trusting the conventions:
+
+| role | bank(s) | file |
+| --- | --- | --- |
+| `attack` | `battle.ON_ABILITY_START.char_4182_oblvns.attack.4.1` | `Player/p_atk/p_atk_MJCkyrdslnt` |
+| `hit` | `battle.ON_PROJECTILE_HIT.projectile_chr_oblvns`, `…projectile_chr_oblvns_talent` | `Player/p_imp/p_imp_MJCkyrdnt` |
+
+`p_atk_MJCkyrdslnt` is carried by **exactly one** bank of the official `soundFXBanks` (13,108 in the 0.2.1 dump), and
+the generic attack pass reaches it only because `normalModeBank` does not read `_slnt` as a skill take — the ten
+`ON_ABILITY_ON.…attack.*` / `…combat.*` banks (the numbered default mode, `.0` included) carry the other take
+`p_atk_MJCkyrdnt_h`, which `public/js/audio.js normalAttackSfx()` refuses for a normal attack (`_h` = a skill mode's
+file, user playtest #4 item 6). Pinning the file the client actually plays is what restores 0.1.4's sound.
+
+**File names are lower-case**, both on disk and in the manifest: the official `audio_data.json` `asset` strings carry the
+upper case (`Audio/Sound_Beta_2/Player/p_skill/p_skill_MJCkyrdglsnt_d1`) but the dump's file **names** do not
+(`player/p_skill/p_skill_mjckyrdglsnt_d1.mp3` answers 200; the `MJC` spelling 404s), and `assetToPath` / `plan.mjs
+soundAlt` lower-case the rel and the URL for every operator. Her seven skill files were on disk as `p_skill_MJC….mp3`
+against a manifest that said `p_skill_mjc…` — invisible on Windows, a 404 on a Linux server; they were renamed, and
+`test/sfx-oblvns.test.js` now compares the manifest's paths against the directory listing itself.
+
+Not consumed on purpose (official banks exist, the project does not read them): the skill notes' own impact banks — S1
+`ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` (`p_imp_MJCkyrdglsnt`), S2 `…projectile_chr_oblvns_s2` /
+`…_s2_slow` (`p_imp_MJCkyrdnt_r` / `…_p`), S3 `…projectile_chr_oblvns_s3_phy` / `…_s3_mag`
+(`p_imp_MJCkyrdslnt`) — because the manifest has **one** `hit` per unit and the client plays exactly that for every
+damage it can attribute to the unit; 0.1.4 shipped none of them either. `ON_PROJECTILE_BORN.projectile_chr_oblvns_talent`
+(`p_atk_MJCkyrdnt`, the note's launch) is not written anywhere: the plan's `projectile.born` is a fallback for the
+`attack` role, while the manifest's `born` is the **deployment** sound (`ON_UNIT_BORN`, `audio.js deploySfxUrl`).
+
 Outputs:
 - `data/assets.json`: the manifest (committed).
 - `public/assets/**`: art and audio (git-ignored).

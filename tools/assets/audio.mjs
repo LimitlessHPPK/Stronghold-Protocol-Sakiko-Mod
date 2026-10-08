@@ -6,6 +6,9 @@
 //   bank is named differently are the explicit SKILL_START_BANKS table below
 //   (indexAudio().skillStart). pickUnitSfx() turns them into the roles the
 //   client plays: attack (swing/cast), hit (impact), skill (activation), die, born.
+//   A unit whose attack / hit the conventions cannot name reliably (or at all) is
+//   listed in UNIT_SFX_BANKS below (unitSfxBanks — plan.mjs merges it over the
+//   conventional pick), the same "name the bank explicitly" shape SKILL_START_BANKS uses.
 // - BGM banks (`battle.ON_GAME_READY.<event>`, `sys.ON_ACTIVITY_LOADED.<act>`)
 //   carry an optional intro and a loop.
 // - UI SFX: autochess banks (ui./battle.ON_ACT1AUTOCHESS_*) mapped to event
@@ -238,6 +241,73 @@ export function pickUnitSfx(banks, opts = {}) {
   if (banks.get('ON_UNIT_DEAD')?.length) out.die = banks.get('ON_UNIT_DEAD');
   if (banks.get('ON_UNIT_BORN')?.length) out.born = banks.get('ON_UNIT_BORN');
   return out;
+}
+
+/**
+ * Unit SFX banks the conventions of pickUnitSfx() cannot name reliably, one entry per unit id: role → the official bank
+ * names to read, in order (`unitSfxBanks()` resolves them through the audio index; plan.mjs merges the result over the
+ * conventional pick, so a role listed here is pinned and the roles that are not keep their usual resolution).
+ *
+ * 丰川祥子 (`char_4182_oblvns`) — the Ave Mujica collaboration operator this repo adds locally as a 自选 (diy) pick, so
+ * her banks are the official ones while nothing else about her is special. Both of her roles are the files the 0.1.4
+ * tree's manifest carried (`attack` `p_atk_…slnt`, `hit` `p_imp_…dnt`), i.e. this table restores 0.1.4 and pins WHERE
+ * those two values came from — they were never unresolvable, but `attack` was reached by accident, see below:
+ *
+ *   attack `battle.ON_ABILITY_START.char_4182_oblvns.attack.4.1` → `Player/p_atk/p_atk_MJCkyrdslnt`
+ *     The ONLY bank of the official index (all 13,108 `soundFXBanks` of the 0.2.1 dump searched — the file appears in
+ *     exactly one) that carries it: her ten `ON_ABILITY_ON` banks (`…attack.0.1` … `.3.1`, `.5.1` and their `combat.*`
+ *     twins) all carry the other take `Player/p_atk/p_atk_MJCkyrdnt_h`. So both 0.1.4 and today's resolver reach this
+ *     file through the generic `firstMatching('ON_ABILITY_START', ['attack', 'combat'])` pass — which accepts a mode-4
+ *     bank only because `normalModeBank` does NOT read `_slnt` as a skill take (SKILL_MODE_FILE wants `_d` / `_h` / `_s`
+ *     + digits, and `p_atk_mjckyrdslnt.mp3` ends in `_slnt`). That is a name-luck, not a rule: the moment anyone teaches
+ *     the filter about `_slnt`-shaped names, or prefers the numbered default mode (`ON_ABILITY_ON.…attack.0.1` /
+ *     `combat.0`) the way ai.js reads a numbered-mode operator, her swing sound silently changes or disappears — hence
+ *     the pin.
+ *     Why NOT the default-mode take `p_atk_MJCkyrdnt_h`: `public/js/audio.js normalAttackSfx()` refuses an operator's
+ *     `_d` / `_h` / `_s` file for a NORMAL attack (user playtest #4 item 6: 纯烬艾雅法拉's S3 impact rang on every hit),
+ *     so a manifest pointing at it would be a field the client never plays — silence, not a different sound. Pinning the
+ *     take the client does play is what makes her 发出音符 audible again.
+ *   hit `battle.ON_PROJECTILE_HIT.projectile_chr_oblvns` and `…projectile_chr_oblvns_talent`
+ *     → both `Player/p_imp/p_imp_MJCkyrdnt` (one file after dedupe). Her ordinary attack IS the talent's homing note
+ *     (ai.js `noAttackVis` / `noAttackDamage`; the kit fires it), so its impact sound is this projectile's hit bank.
+ *
+ * Deliberately NOT consumed (kept out on purpose, not forgotten): the skill notes' own impact banks — S1
+ * `battle.ON_CUSTOM_TRIGGER.projectile_chr_oblvns_s1_hit` (`p_imp_MJCkyrdglsnt`), S2 `…projectile_chr_oblvns_s2` /
+ * `…_s2_slow` (`p_imp_MJCkyrdnt_r` / `…_p`), S3 `…projectile_chr_oblvns_s3_phy` / `…_s3_mag`
+ * (`p_imp_MJCkyrdslnt`). The manifest has ONE `hit` per unit and the client plays exactly that for every damage it can
+ * attribute to the unit (public/js/audio.js handleBattleEvents), so a per-skill hit needs a schema that does not exist;
+ * 0.1.4 shipped none of them either. `battle.ON_PROJECTILE_BORN.projectile_chr_oblvns_talent` (`p_atk_MJCkyrdnt`, the
+ * note's launch) is not written anywhere for the same reason: the plan's `projectile.born` is a fallback for the ATTACK
+ * role, while the manifest's `born` is the DEPLOYMENT sound (public/js/audio.js deploySfxUrl / ON_UNIT_BORN).
+ */
+export const UNIT_SFX_BANKS = Object.freeze({
+  char_4182_oblvns: Object.freeze({
+    attack: Object.freeze(['battle.ON_ABILITY_START.char_4182_oblvns.attack.4.1']),
+    hit: Object.freeze(['battle.ON_PROJECTILE_HIT.projectile_chr_oblvns', 'battle.ON_PROJECTILE_HIT.projectile_chr_oblvns_talent']),
+  }),
+});
+
+/**
+ * The pinned roles of one unit (UNIT_SFX_BANKS) as role → sound paths, resolved through the audio index: a projectile
+ * bank is not part of a unit's own bank table (indexAudio().unitBanks keys it by projectile, not by unit), so the plan
+ * cannot resolve these inside pickUnitSfx's `banks`. Deduped in bank order (her two hit banks are one file). null when
+ * the unit is not listed, or when the official data carries none of its banks (a missing bank is not an error here: the
+ * conventional pick then stays in charge of that role).
+ * @param {{ bank: (name:string)=>string[] }} audio from indexAudio()
+ * @param {string} id unit id (a manifest sfx.units key: charId / tokenId / enemyId)
+ * @returns {Record<string, string[]>|null}
+ */
+export function unitSfxBanks(audio, id) {
+  const banks = UNIT_SFX_BANKS[id];
+  if (!banks || !audio) return null;
+  /** @type {Record<string, string[]>} */
+  const out = {};
+  for (const [role, names] of Object.entries(banks)) {
+    const paths = [];
+    for (const name of names) for (const p of audio.bank(name)) if (!paths.includes(p)) paths.push(p);
+    if (paths.length) out[role] = paths;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**
