@@ -59,18 +59,19 @@ export function freePort() {
 /**
  * Start the real server (`node server/index.js`, or test/e2e/fastServer.mjs with `fast` speed-ups) on a free port (or
  * `port`: e.g. the port of a server just stopped — a server restart the open clients reconnect to).
- * @param {{ port?: number, fast?: { timerScale?: number, combatSpeed?: number, startRound?: 'boss'|'hidden'|number, kit?: number, chess?: string[],
+ * @param {{ port?: number, env?: Record<string, string>, fast?: { timerScale?: number, combatSpeed?: number, startRound?: 'boss'|'hidden'|number, kit?: number, chess?: string[],
  *   items?: string[], idleBots?: boolean, kits?: string[][], botChess?: string[], autoPlace?: boolean, eliminate?: number[], stage?: string,
  *   finishAfter?: number } }} [opts]
  *   kits: per-human starter kits (seat order); botChess: the AI seats' kit; autoPlace: the kits go onto the board at the
  *   first prep; eliminate: humans (seat order) eliminated at the jump; stage: the stage of every match; finishAfter: the
  *   match ends (RESULT) once that round has settled — fastServer.mjs hooks
+ *   env: extra environment variables of the server process (e.g. SP_DEV_GRANT=1 for /dev/grant)
  * @returns {Promise<{ base: string, port: number, logs: string[], stop: (o?: { hard?: boolean }) => Promise<void> }>}
  */
 export async function startRealServer(opts = {}) {
   const port = Number.isInteger(opts.port) && opts.port > 0 ? opts.port : await freePort();
   const entry = opts.fast ? path.join(ROOT, 'test/e2e/fastServer.mjs') : path.join(ROOT, 'server/index.js');
-  const env = { ...process.env, PORT: String(port), HOST: '127.0.0.1' };
+  const env = { ...process.env, PORT: String(port), HOST: '127.0.0.1', ...(opts.env || null) };
   // under `node --test` the runner's marker would turn fastServer.mjs into a no-op module (it is not a test file)
   delete env.NODE_TEST_CONTEXT;
   if (opts.fast) {

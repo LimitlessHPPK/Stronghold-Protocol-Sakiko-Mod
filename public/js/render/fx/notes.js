@@ -63,8 +63,9 @@ export class FxNotes {
    *     really dealt already plays its own cue (`public/js/audio.js handleBattleEvents`, the `dmg` attribution).
    * A note's `kind` picks PROJ.note / PROJ.noteSkill (unknown kinds fall back to PROJ.note).
    * @param {any[]|null} list `snap.proj` entries
-   * @param {{ play?: (kind: string, o: object) => boolean }|null} [sink] where the launch sound goes (default: the app's
-   *   `audio` singleton) — injectable so a render test can count the launches without an AudioContext
+   * @param {{ playProj?: (kind: string, o: object) => boolean, play?: (kind: string, o: object) => boolean }|null} [sink]
+   *   where the launch sound goes (default: the app's `audio` singleton, whose entry point is `playProj`) — injectable
+   *   so a render test can count the launches without an AudioContext
    */
   syncNotes(list, sink = null) {
     const seen = this._noteSeen || (this._noteSeen = new Set());
@@ -105,7 +106,7 @@ export class FxNotes {
    * @param {string} kind 'note' | 'noteSkill' (unknown kinds: the manifest decides — no entry, no sound)
    * @param {number} x board column of the note's first frame
    * @param {number} y board row
-   * @param {{ play?: (kind: string, o: object) => boolean }|null} sink
+   * @param {{ playProj?: (kind: string, o: object) => boolean, play?: (kind: string, o: object) => boolean }|null} sink
    */
   _noteFired(kind, x, y, sink) {
     try {
@@ -116,9 +117,14 @@ export class FxNotes {
       // is the right price for never sounding a launch nobody just made.
       if (!(this.time > 0)) return;
       const who = this._noteOwner(x, y);
+      // The app's `audio` singleton is an AudioManager, and its projectile entry point is `playProj` — it has NO
+      // `play` method at all (audio.js: playProj / unit / battle / sfx / voice). A `play`-only fake used to be the
+      // only thing this branch was ever run against, so the guard below silently swallowed every launch on a real
+      // client (owner report 「天赋发射的音符没有诞生音效」). Ask for the API that exists, and keep accepting a bare
+      // `play` sink so a harness stays a harness.
       const api = sink ?? audio;
-      if (typeof api?.play !== 'function') return;
-      api.play(k, { unitId: who?.id ?? null, unit: who?.def ?? null });
+      if (typeof api?.playProj === 'function') api.playProj(k, { unitId: who?.id ?? null, unit: who?.def ?? null });
+      else if (typeof api?.play === 'function') api.play(k, { unitId: who?.id ?? null, unit: who?.def ?? null });
     } catch { /* a frame is never broken by a sound */ }
   }
 

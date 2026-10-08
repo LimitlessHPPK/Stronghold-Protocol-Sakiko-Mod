@@ -6,8 +6,10 @@
 // spec must never read another skill's blackboard.
 //
 // The mechanics follow the official notes quoted in docs/research/12-sakiko.md: §16 Fever (450 points, a FULL gauge,
-// any activation, the switch skill excluded, no SP inside, the sustained-skill clocks) and §17 (one note-parameter row
-// per skill, S1's 13.125° / 3.75° fan, S3's −3000 protection). §5.4 is the LOR-Y module: 「技能期间远程攻击不再降低攻击力」
+// any activation, the switch skill excluded, no SP inside, the sustained-skill clocks), §17 (one note-parameter row
+// per skill, S1's 13.125° / 3.75° fan, S3's −3000 protection) and §5.7 (【追踪移动】 locks on and then charges STRAIGHT
+// at its target — 转向速度 is only the per-frame ceiling on the swing, so the distance to a locked target falls every
+// tick; the owner's report of 2026-10-08, 「一旦锁定敌人后应该径直冲向敌人，而不是在外部兜圈」). §5.4 is the LOR-Y module: 「技能期间远程攻击不再降低攻击力」
 // (stage 2 / 3 of `uniequip_002_oblvns`, the kit reads the sentence — it has no blackboard key — and the 自选 path ships
 // stages 1 and 3 only, so the stage-2 record is composed in `recordAt` below from the official phase-2 numbers) and the
 // conditional 攻击速度+12 the ENGINE consumes (content/traitMods.js, not the kit). The 0.1.4 tree implements the same
@@ -774,6 +776,111 @@ test('a note of a targetless attack hunts for itself: it switches to tracking in
   assert.ok(peak >= 1 && peak <= 12, `a few notes at a time, not an armada (peak ${peak})`);
   assert.ok(seen.size > peak, `notes come and go (${seen.size} launched, ${peak} at once)`);
   assert.equal(notesOf(h, u).length <= peak, true, 'no leak');
+  done(h);
+});
+
+/**
+ * Per-tick samples of every note of one tag, keyed by note id: `lock` = the 【追踪移动】 samples (state 'track' AND a
+ * live target), each { t, d, deg } — `d` = the distance to the locked target, `deg` = the angle between the note's
+ * heading and the direction to that target. `states` = the states it was seen in, in order; `backToFree` = it was seen
+ * in 【自由移动】 AFTER it had locked.
+ */
+function sampleNotes(h, u, tag = 'skill', seconds = 4) {
+  const per = new Map();
+  for (let i = 0; i < Math.round(seconds / h.TICK); i++) {
+    h.step(1);
+    for (const p of notesOf(h, u, tag)) {
+      const st = p.data.st;
+      const t = st.target && st.target.alive && st.state === 'track' ? st.target : null;
+      const d = t ? Math.hypot(t.x - p.x, t.y - p.y) : 0;
+      const deg = t && d > 1e-9 ? Math.acos(Math.max(-1, Math.min(1, (st.vx * (t.x - p.x) + st.vy * (t.y - p.y)) / d))) * 180 / Math.PI : null;
+      if (!per.has(p.id)) per.set(p.id, { id: p.id, lock: [], states: [], backToFree: false });
+      const r = per.get(p.id);
+      if (t) r.lock.push({ t: h.b.time, d, deg });
+      if (r.states[r.states.length - 1] !== st.state) r.states.push(st.state);
+      if (st.state === 'free' && r.states.includes('track')) r.backToFree = true;
+    }
+  }
+  return [...per.values()];
+}
+
+/**
+ * 锁定后径直冲向目标 — the owner's report of 2026-10-08: 「一技能发射的音符一旦锁定敌人后应该径直冲向敌人，而不是在外部
+ * 兜圈」. §17 puts 转向速度 INSIDE the 【追踪移动】策略 sentence (「固定 2.2 速度向目标移动，转向速度 1/6 每帧」), so the
+ * heading is towards the target and the turn value is only the ceiling on how far it may swing per frame — it may never
+ * be satisfied by pointing the note away from its target. Before the fix the swing was the per-frame weight
+ * `dir = dir·(1−turn) + to·turn`, i.e. an angular rate of `turn·sin θ` — ZERO at θ = 180°, and a stable orbit at any r
+ * where `turn·sin θ = trackSpeed·dt / r`. S1's own row (最短自由移动 0.6 s, 固定 1.7) always flies a note past an adjacent
+ * enemy before it may lock, so all eight notes came back around it: measured at r ≈ 0.6 tiles, aim error stuck at
+ * ~127°, 11 rising-distance ticks (12-sakiko.md §5.7 has the raw timeline).
+ */
+test('S1 锁定后径直冲向目标: 追踪态的每一 tick 距离都在缩短、朝向就是目标方向（不再绕圈）', () => {
+  for (const [epos, why] of [[[10, 5], 'adjacent: the lock starts in the target\'s REAR hemisphere (径直)'],
+    [[10, 7], 'three tiles ahead: the lock starts off-axis in the FORWARD hemisphere (转向速度 as a ceiling)']]) {
+    const { h, u } = field({ tier: 5, elite: false, skill: 0, enemies: [{ key: 'enemy_dummy', pos: epos }] });
+    h.run(0.2);
+    u.skill.gainSp(9999);
+    assert.equal(u.skill.activate('manual'), true, `${epos}: S1 fired`);
+    const notes = sampleNotes(h, u, 'skill', epos[1] === 5 ? 12 : 4);
+    const locked = notes.filter((r) => r.lock.length);
+    assert.ok(locked.length >= 8, `${epos}: the fan locked on (${locked.length} notes) — ${why}`);
+    assert.ok(locked.every((r) => !r.backToFree), `${epos}: no locked note ever went back to 【自由移动】`);
+    for (const r of locked) {
+      const maxD = Math.max(...r.lock.map((s) => s.d));
+      for (let i = 1; i < r.lock.length; i++) {
+        assert.ok(r.lock[i].d < r.lock[i - 1].d,
+          `${epos}: note #${r.id} closed on its target every tick (t=${r.lock[i].t.toFixed(3)}: ${r.lock[i - 1].d.toFixed(3)} → ${r.lock[i].d.toFixed(3)})`);
+      }
+      const first = r.lock[0], last = r.lock[r.lock.length - 1];
+      assert.ok(last.deg < 5, `${epos}: note #${r.id} ended up pointing at its target (${last.deg.toFixed(2)}° at d=${last.d.toFixed(3)})`);
+      assert.ok(maxD <= first.d + 1e-9, `${epos}: note #${r.id} never backed off after locking (${first.d.toFixed(3)} → max ${maxD.toFixed(3)})`);
+    }
+    // the adjacent case is the one the owner saw: it must charge straight back, not lap the enemy
+    if (epos[1] === 5) assert.ok(locked.every((r) => r.lock[0].deg < 1), 'the rear-hemisphere lock is 径直 from its first tick');
+    else assert.ok(locked.some((r) => r.lock[0].deg > 5 && r.lock.length >= 10), 'the off-axis lock is swung at 转向速度 over many ticks');
+    done(h);
+  }
+});
+
+test('天赋音符锁定后同样径直冲向目标（同一个 noteSteer）', () => {
+  // an enemy straight ABOVE her: the ordinary-attack note is launched along her facing (±20°) and locks in the rear
+  // hemisphere — before the fix this note arced out to 1.62 tiles (4 rising ticks for it, 15 across the five of the
+  // scene) and needed 1.17 s for a target one tile away.
+  const { h, u } = field({ tier: 5, elite: false, skill: 1, enemies: [{ key: 'enemy_dummy', pos: [9, 4] }] });
+  const locked = sampleNotes(h, u, 'talent').filter((r) => r.lock.length >= 4);
+  assert.ok(locked.length >= 3, `talent notes locked (${locked.length})`);
+  for (const r of locked) {
+    for (let i = 1; i < r.lock.length; i++) {
+      assert.ok(r.lock[i].d < r.lock[i - 1].d, `note #${r.id}: distance fell every tick (${r.lock[i - 1].d.toFixed(3)} → ${r.lock[i].d.toFixed(3)})`);
+    }
+    const first = r.lock[0], last = r.lock[r.lock.length - 1];
+    assert.ok(first.deg < 1, `note #${r.id}: locked straight at its target (${first.deg.toFixed(2)}°)`);
+    assert.ok(last.deg < 1 && last.d < first.d, `note #${r.id}: charged it down (${first.d.toFixed(3)} → ${last.d.toFixed(3)})`);
+    assert.ok(Math.max(...r.lock.map((s) => s.d)) <= first.d + 1e-9, `note #${r.id}: no lap around the target`);
+  }
+  done(h);
+});
+
+test('锁定是粘的: 目标消失后不回【自由移动】、也不改锁别的敌人（范围外连续 delay 无目标即消失）', () => {
+  // two enemies OUT of her range, so these notes start targetless (持续攻击) and hunt for themselves (追踪半径 1.0)
+  const { h, u } = field({ skill: 0, enemies: [{ key: 'enemy_far', pos: [10, 8] }, { key: 'enemy_dummy', pos: [10, 9] }] });
+  const a = h.enemy('enemy_far');
+  h.runUntil(() => notesOf(h, u).some((p) => p.data.st.state === 'track' && p.data.st.target === a), 20);
+  const watched = notesOf(h, u).filter((p) => p.data.st.state === 'track' && p.data.st.target === a);
+  assert.ok(watched.length, 'a hunting note locked onto the far enemy');
+  h.b.kill(a);
+  let backToFree = 0, relocked = 0;
+  for (let i = 0; i < 150; i++) {
+    h.step(1);
+    for (const p of watched) {
+      if (!h.b.projectiles.list.includes(p)) continue;
+      if (p.data.st.state === 'free') backToFree++;
+      if (p.data.st.target && p.data.st.target.alive) relocked++;   // …especially onto the second enemy (the old code re-acquired whatever was near)
+    }
+  }
+  assert.equal(backToFree, 0, 'a locked note never returns to 【自由移动】 after its target dies');
+  assert.equal(relocked, 0, 'a locked note never picks another target');
+  assert.ok(watched.every((p) => !h.b.projectiles.list.includes(p)), 'and the 范围外连续 delay 秒无追踪目标 rule retires every one of them');
   done(h);
 });
 

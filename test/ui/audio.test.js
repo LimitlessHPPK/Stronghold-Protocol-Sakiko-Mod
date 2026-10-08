@@ -432,6 +432,21 @@ describe('AudioManager', () => {
     assert.deepEqual(a.volumes, { bgm: 1, sfx: 0, voice: 0.8, muted: true });
     assert.equal(a.unlocked, false);
   });
+  test('the manager has no `play`: the projectile entry point is `playProj` (render/fx/notes.js asks for it)', () => {
+    // The manager's battle surface is playProj / unit / battle / sfx / voice — `play` is NOT one of them. notes.js
+    // `_noteFired` used to call `api.play(k, …)` and bail on a `typeof api.play` guard, so every 音符 launch was silent
+    // in a real client while a `play`-only test fake kept the render suite green (owner report 「天赋发射的音符没有诞生音效」;
+    // measured in a browser: 21 talent notes born, 0 launch requests). Pin the surface: this test fails the moment
+    // someone renames/removes playProj or adds a `play` that would re-open the divergence.
+    assert.equal(typeof AudioManager.prototype.play, 'undefined', 'no generic `play` — notes.js must ask for playProj');
+    assert.equal(typeof AudioManager.prototype.playProj, 'function', 'the projectile launch entry point');
+    const a = new AudioManager({ win: null, getManifest: () => manifest });
+    a.ctx = {};
+    const played = [];
+    a._play = (url, o) => { played.push([url, o.unitKey]); };
+    assert.equal(a.playProj('note', { unitId: 1, unit: 'char_4182_oblvns' }), true);
+    assert.deepEqual(played, [[manifest.audio.sfx.proj.note.born, 'proj:note:1']], 'playProj is what the renderer must reach');
+  });
   test('unlocks on the first gesture, then plays BGM and SFX from the manifest', async () => {
     const fw = fakeWindow();
     const origFetch = globalThis.fetch;

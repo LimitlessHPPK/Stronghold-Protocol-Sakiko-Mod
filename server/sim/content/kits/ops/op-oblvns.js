@@ -103,11 +103,14 @@ const NOTE_TAG = 'sakiko:note';
 //                                                               3.0 速度, 0.5 s
 //
 // `update` = 更新间隔 (how often the note re-decides), `minFree` = 最短自由移动时间, `seekR` = 追踪范围半径,
-// `trackSpeed` = 【追踪移动】速度, `turn` / `turnFree` = 转向速度 per frame while tracking / while free (the talent's
-// two sets, PRTS 天赋备注). `free: 'sine'` = the 扩张正弦 curve (基础振幅 `sineAmp`, x 速度 `sineX` — PRTS 特殊机制:
-// 以当前位置为原点、当前方向为 +x 轴, sin 或 −sin（各 50 %）, 第 n 周期的振幅 = 基础振幅 × n（n ≤ 3）),
-// `free: 'straight'` = a fixed `freeSpeed` along the current direction; the talent's own aimed set moves straight
-// instead of drifting (`straightWhenAimed`). `hit` = S2 钢琴's 【已命中】: a `radius` collision flown on at `speed`.
+// `trackSpeed` = 【追踪移动】速度, `turn` / `turnFree` = 转向速度 per frame for a note launched WITH / WITHOUT a target
+// (the talent's two tables, PRTS 天赋备注) — the ceiling on how far the 【追踪移动】 heading may swing towards its target
+// in one frame, as a fraction of the angle that is left (TRACK_HEADS_AT_THE_TARGET above explains both cases and why a
+// heading pointing away from the target is not swung at that rate at all). `free: 'sine'` = the 扩张正弦 curve (基础振幅
+// `sineAmp`, x 速度 `sineX` — PRTS 特殊机制: 以当前位置为原点、当前方向为 +x 轴, sin 或 −sin（各 50 %）, 第 n 周期的振幅 =
+// 基础振幅 × n（n ≤ 3）), `free: 'straight'` = a fixed `freeSpeed` along the current direction; the talent's own aimed
+// set moves straight instead of drifting (`straightWhenAimed`). `hit` = S2 钢琴's 【已命中】: a `radius` collision flown on
+// at `speed`.
 const NOTE_TALENT = Object.freeze({
   update: 0.4, minFree: 0.1, seekR: 1.0, trackSpeed: 2.0, turn: 1 / 6, turnFree: 7 / 30,
   free: 'sine', straightWhenAimed: true, sineAmp: 0.3, sineX: 1.3,
@@ -481,14 +484,39 @@ function nearestFoe(battle, unit, x, y, r) {
 }
 
 /**
- * The official flight of one note (the per-skill parameter rows are tabulated at the NOTE_* constants).
+ * TRACK_HEADS_AT_THE_TARGET — what 【追踪移动】 means, and what 转向速度 is (owner's report, 2026-10-08: 「一技能发射的
+ * 音符一旦锁定敌人后应该径直冲向敌人，而不是在外部兜圈」).
+ *
+ * The official rows put BOTH numbers in the same 【追踪移动】策略 sentence (PRTS §17, verbatim): S1 「【追踪移动】策略：
+ * 固定 2.2 速度**向目标移动**，转向速度 1/6 每帧」, S2 钢琴 「追踪 = 固定 3.5 速度，转向 1/2 每帧」, S2 风琴 「追踪 =
+ * 固定 1.0 速度，转向 1/12 每帧」, S3 「追踪 = 固定 1.3 速度，转向 1/4 每帧」; the talent's two tables carry the same
+ * pair per launch type (无目标发射 7/30, 有目标发射 1/6). So 转向速度 belongs to the TRACKING state (it is not the
+ * free-movement turn), and the movement it limits is 「向目标移动」 — the note's velocity is aimed at its target.
+ *
+ * 转向速度 is therefore only the CEILING on how far the note's heading may swing towards the target in one frame, taken as
+ * a fraction of the angle still left (`turn`), never a force that keeps the note off its target:
+ *
+ *   * forward hemisphere (dot(heading, toTarget) > 0): the heading swings by `turn` × θ towards the target, θ being
+ *     what is left of the angle. The swing only ever shrinks an angle that is already < 90°, so the radial component
+ *     stays positive and the distance to the target STRICTLY DECREASES every frame — no orbit radius exists;
+ *   * rear hemisphere (dot ≤ 0): a capped swing would still carry the note AWAY (θ·(1−turn) > 90° for the first
+ *     frames), i.e. it would trace a lap around its target — the exact 兜圈 the owner reported, and a stable limit
+ *     cycle, not a passing artefact: a note whose heading sits θ off its target turns at `turn·sin θ` per frame, so
+ *     it settles at the radius r where `turn·sin θ = trackSpeed·dt / r` (measured before the fix: r ≈ 0.55–0.6 tiles
+ *     at S1's 2.2 / 1/6, and the note never came closer while it orbited). Such a heading is set STRAIGHT at the
+ *     target instead: 锁定即径直. The cap is about how fast the note may *point* itself at the target, and it may
+ *     never be satisfied by pointing away from it.
+ *
+ * The LOCK itself is sticky: a note that entered 【追踪移动】 never goes back to 【自由移动】 and never picks another
+ * enemy; if its target dies / vanishes it keeps its heading and the 「音符位于自身攻击范围外时，若连续 `delay` 秒以上不
+ * 存在追踪目标则消失」 rule retires it (the `noneFor` bookkeeping below). A note launched with no target at all
+ * (持续攻击 on an empty range) still hunts for itself — 追踪范围半径 `cfg.seekR` — until its first lock.
  *
  * `st` is the note's own state, shared with `onHit`: 【自由移动】 until an update finds a targetable enemy within
- * `cfg.seekR`, then 【追踪移动】. The direction only ever turns towards the target (转向速度 is a per-frame weight:
- * `dir = dir·(1−turn) + toTarget·turn`), which is what makes the tracking visible. A note in 【自由移动】 either
- * follows the 扩张正弦 curve (cfg.free 'sine') or runs straight along its launch direction (cfg.free 'straight', the
- * talent's aimed set and S1) — it drifts out of her range and, per PRTS 「音符位于自身攻击范围外时，若连续 1 s 以上
- * 不存在追踪目标则消失」, is gone `delay` s after it last had a target.
+ * `cfg.seekR`, then 【追踪移动】 for good. A note in 【自由移动】 either follows the 扩张正弦 curve (cfg.free 'sine') or
+ * runs straight along its launch direction (cfg.free 'straight', the talent's aimed set and S1) — it drifts out of her
+ * range and, per PRTS 「音符位于自身攻击范围外时，若连续 1 s 以上不存在追踪目标则消失」, is gone `delay` s after it
+ * last had a target.
  *
  * S2's piano is the one note with an 【已命中】 state: reaching its target does not end it — it switches to a 0.8-tile
  * collision that keeps flying straight at 3.0 for `hitFor` s (the row's own `attack@passby_delay`), damaging every
@@ -522,36 +550,53 @@ function noteSteer(battle, unit, st, cfg, strike) {
       st.sinceUpdate = 0;
       if (st.state === 'free') {
         if (!st.target || !st.target.alive) st.target = nearestFoe(battle, unit, p.x, p.y, cfg.seekR);
-        if (st.target && st.freeFor >= cfg.minFree) st.state = 'track';
-      } else if (!st.target || !st.target.alive || st.target.hidden) {
-        // 【追踪移动】: the target is gone — back to 【自由移动】 along the current direction
+        if (st.target && st.freeFor >= cfg.minFree) st.state = 'track';   // 锁定 (sticky — see the header above)
+      } else if (st.target && (!st.target.alive || st.target.hidden)) {
+        // 【追踪移动】 with the locked target gone: NOT back to 【自由移动】, and no other enemy is ever picked
+        // (the lock is sticky — see the header above): the note keeps its heading and the 「范围外连续 delay 秒不存在
+        // 追踪目标」 rule below ends it
         st.target = null;
-        st.state = 'free';
-        st.freeFor = 0;
-        st.ox = p.x; st.oy = p.y; st.ax = st.vx; st.ay = st.vy; st.u = 0;
       }
     }
     // --- 运动 -----------------------------------------------------------------------------------------
     if (st.state === 'track') {
-      const dx = st.target.x - p.x, dy = st.target.y - p.y;
-      const d = Math.hypot(dx, dy) || 1e-6;
-      const turn = st.aimed ? cfg.turn : num(cfg.turnFree, cfg.turn);
-      st.vx = st.vx * (1 - turn) + (dx / d) * turn;
-      st.vy = st.vy * (1 - turn) + (dy / d) * turn;
-      const n = Math.hypot(st.vx, st.vy) || 1e-6;
-      st.vx /= n; st.vy /= n;
       const step = cfg.trackSpeed * dt;
-      p.x += st.vx * step;
-      p.y += st.vy * step;
-      if (d <= Math.max(0.25, step)) {
-        if (!cfg.hit) return true;                                     // 命中 (no 【已命中】 state: the note is spent)
-        // S2 钢琴: the impact starts the pass — the target takes the damage now, the note flies on for `passby` s
-        st.state = 'hit';
-        st.hitFor = 0;
-        st.hitSet = new Set();
-        st.resolved = true;
-        if (st.target) { st.hitSet.add(st.target); strike(st.target); }
-        return false;
+      if (st.target) {
+        // 【追踪移动】: 固定 `trackSpeed` 速度向目标移动 (§17) — the heading IS the direction to the target, and
+        // 转向速度 (cfg.turn / cfg.turnFree) is only the ceiling on this frame's swing, a `turn` fraction of the
+        // angle that is left. See TRACK_HEADS_AT_THE_TARGET for the two cases and why the rear one is not capped.
+        const dx = st.target.x - p.x, dy = st.target.y - p.y;
+        const d = Math.hypot(dx, dy) || 1e-6;
+        const ux = dx / d, uy = dy / d;
+        const dot = st.vx * ux + st.vy * uy;             // the radial component of the current heading
+        if (dot <= 0) {
+          st.vx = ux; st.vy = uy;                        // rear hemisphere: 径直, never a lap around the target
+        } else {
+          const turn = st.aimed ? cfg.turn : num(cfg.turnFree, cfg.turn);
+          const cross = st.vx * uy - st.vy * ux;         // the sign of the swing towards the target
+          const a = Math.atan2(Math.abs(cross), dot) * turn * (cross < 0 ? -1 : 1);
+          const ca = Math.cos(a), sa = Math.sin(a);
+          const vx = st.vx * ca - st.vy * sa, vy = st.vx * sa + st.vy * ca;
+          const n = Math.hypot(vx, vy) || 1e-6;
+          st.vx = vx / n; st.vy = vy / n;
+        }
+        p.x += st.vx * step;
+        p.y += st.vy * step;
+        if (d <= Math.max(0.25, step)) {
+          if (!cfg.hit) return true;                                     // 命中 (no 【已命中】 state: the note is spent)
+          // S2 钢琴: the impact starts the pass — the target takes the damage now, the note flies on for `passby` s
+          st.state = 'hit';
+          st.hitFor = 0;
+          st.hitSet = new Set();
+          st.resolved = true;
+          if (st.target) { st.hitSet.add(st.target); strike(st.target); }
+          return false;
+        }
+      } else {
+        // locked, but its target is gone: it runs on along its heading (no re-steering, no new target) and the
+        // 「范围外连续 delay 秒无追踪目标」 rule below retires it
+        p.x += st.vx * step;
+        p.y += st.vy * step;
       }
     } else if (straight) {
       p.x += st.vx * freeSpeed * dt;                        // 【自由移动】固定速度沿当前方向 (S1 1.7 / 天赋 2.0)
@@ -565,7 +610,7 @@ function noteSteer(battle, unit, st, cfg, strike) {
       p.y = st.oy + st.ay * st.u + py * off;
     }
     // --- 消失: 位于自身攻击范围外 且 连续 delay 秒没有追踪目标 ------------------------------------------
-    if (st.state === 'track' || inRangeOf(unit, p.x, p.y)) st.noneFor = 0;
+    if ((st.state === 'track' && st.target) || inRangeOf(unit, p.x, p.y)) st.noneFor = 0;
     else st.noneFor += dt;
     if (st.noneFor >= st.delay) { st.expired = true; return true; }
     return false;

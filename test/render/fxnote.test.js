@@ -55,6 +55,18 @@ function soundSink() {
   return { calls, play: (kind, o) => { calls.push({ kind, ...o }); return true; } };
 }
 
+/**
+ * The REAL entry point of `public/js/audio.js AudioManager` — `playProj(kind, o)` — and nothing else. The manager has
+ * no `play` method at all, so a sink that only knows `play` is not the app: `_noteFired` used to guard on
+ * `typeof api.play === 'function'` and returned in silence on every real battle (owner report 「天赋发射的音符没有诞生
+ * 音效」, measured in a browser: 21 notes born, 0 launch requests). This fake is that API surface, and
+ * test/ui/audio.test.js pins `typeof AudioManager.prototype.play` to `undefined` so the two cannot drift apart again.
+ */
+function projSink() {
+  const calls = [];
+  return { calls, playProj: (kind, o) => { calls.push({ kind, ...o }); return true; } };
+}
+
 /** The views map app.js passes as ctx.units(): battle unit id → its { x, y, info } view (insertion order = discovery). */
 const unitViews = (list) => new Map(list.map((u) => [u.id, u]));
 
@@ -422,6 +434,37 @@ describe('syncNotes (b.snap `proj`)', () => {
     const two = soundSink();
     fx.syncNotes([[7, 3, 10, 'note'], [8, 12, 10, 'note'], [9, 19.5, 1, 'note'], [10, 12.4, 10, 'note']], two);
     assert.equal(two.calls.at(-1).unitId, 22, 'the note at 12.4 is unit 22’s (12), not far away');
+  });
+
+  test('the launch goes to the manager’s REAL entry point, playProj — which has no `play` at all', () => {
+    // Regression (owner report 「天赋发射的音符没有诞生音效」): `_noteFired` asked for `api.play(k, …)`, an AudioManager
+    // method that does not exist (audio.js: playProj / unit / battle / sfx / voice), so the guard returned before every
+    // launch. The old test injected a fake that HAD `play`, which is why 21 notes born in a real battle asked for
+    // nothing. Both kinds must reach `playProj`, and the owner the limiter keys on must still ride along.
+    const CHAR = 'char_4182_oblvns';
+    const views = unitViews([{ id: 3, x: 6, y: 4, info: { defId: CHAR, side: 'ally' } }]);
+    const fx = makeFx({ units: () => views });
+    const sink = projSink();
+    fx.update(DT);                                    // a live battle frame (the first one only seeds — next test)
+    fx.syncNotes([[1, 6, 4, 'note'], [2, 6.2, 4.1, 'noteSkill']], sink);
+    assert.deepEqual(sink.calls, [
+      { kind: 'note', unitId: 3, unit: CHAR },
+      { kind: 'noteSkill', unitId: 3, unit: CHAR },
+    ], '发出音符: 天赋音符与技能音符 each reach playProj past the guard');
+    // the API surface the manager actually has: `playProj` is the entry point, `play` does not exist. A sink with
+    // `play` only is a legacy harness, and it must keep working (the guard asks for whichever one exists).
+    const legacy = soundSink();
+    fx.syncNotes([[1, 6, 4, 'note'], [2, 6.2, 4.1, 'noteSkill'], [3, 6.4, 4, 'note']], legacy);
+    assert.deepEqual(legacy.calls, [{ kind: 'note', unitId: 3, unit: CHAR }], 'a play-only sink is still served');
+    // a sink with NEITHER: the note is drawn, nothing is asked for, and the frame survives
+    const mute = makeFx();
+    mute.update(DT);
+    mute.syncNotes([[1, 4, 10, 'note']], {});
+    assert.equal(mute.notes.size, 1, 'a sink without any play entry point never costs the note');
+    // …and a playProj that throws is swallowed like any other unsound audio layer
+    const boom = { playProj: () => { throw new Error('no audio'); } };
+    mute.syncNotes([[1, 4, 10, 'note'], [2, 5, 10, 'note']], boom);
+    assert.equal(mute.notes.size, 2);
   });
 
   test('no sink / no ctx.units() / no audio singleton: the frame never breaks and the note still draws', () => {
